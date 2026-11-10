@@ -10,6 +10,16 @@ const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
 pub type Callback = Arc<dyn Fn() + Send + Sync>;
 
+/// Memori proses aplikasi + semua proses WebView2 turunannya.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TreeMem {
+    /// Private working set (kolom Memory di Task Manager), byte.
+    pub working: u64,
+    /// Private bytes / commit (memori yang benar-benar dialokasikan, termasuk yang di page file), byte.
+    pub commit: u64,
+    pub count: u32,
+}
+
 pub struct ToastSpec {
     pub title: String,
     pub body: String,
@@ -242,24 +252,20 @@ mod imp {
 
     // ---------- diagnostik RAM ----------
 
-    /// Total "private working set" proses ini + semua turunannya (proses WebView2).
-    /// Angka ini sama dengan kolom Memory di Task Manager.
-    pub fn process_tree_memory() -> Option<(u64, u32)> {
+    /// PID proses ini + semua turunannya (proses WebView2).
+    fn tree_pids() -> Vec<u32> {
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
             TH32CS_SNAPPROCESS,
         };
-        use windows::Win32::System::ProcessStatus::{
-            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
-        };
-        use windows::Win32::System::Threading::{
-            GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
+        use windows::Win32::System::Threading::GetCurrentProcessId;
 
         let mut pairs: Vec<(u32, u32)> = Vec::new();
         unsafe {
-            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+            let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+                return Vec::new();
+            };
             let mut e = PROCESSENTRY32W {
                 dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
                 ..Default::default()
@@ -287,8 +293,25 @@ mod imp {
             }
             i += 1;
         }
+        tree
+    }
 
-        let mut total: u64 = 0;
+    /// Memori proses ini + semua turunannya. `working` sama dengan kolom Memory di Task Manager.
+    pub fn process_tree_memory() -> Option<TreeMem> {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::ProcessStatus::{
+            GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
+        };
+        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+        let tree = tree_pids();
+        if tree.is_empty() {
+            return None;
+        }
+        let mut m = TreeMem {
+            count: tree.len() as u32,
+            ..Default::default()
+        };
         for &pid in &tree {
             unsafe {
                 let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
@@ -305,16 +328,43 @@ mod imp {
                 )
                 .is_ok()
                 {
-                    total += if pmc.PrivateWorkingSetSize > 0 {
+                    m.working += if pmc.PrivateWorkingSetSize > 0 {
                         pmc.PrivateWorkingSetSize
                     } else {
                         pmc.WorkingSetSize
                     } as u64;
+                    m.commit += pmc.PrivateUsage as u64;
                 }
                 let _ = CloseHandle(h);
             }
         }
-        Some((total, tree.len() as u32))
+        Some(m)
+    }
+
+    /// Kosongkan working set proses WebView2 (dan proses ini). Halaman yang jarang disentuh
+    /// dilepas dari RAM fisik; Windows memuatnya kembali saat dibutuhkan. Hanya dipakai
+    /// saat Outlook tersembunyi/diminimalkan. Mengembalikan jumlah proses yang dirapikan.
+    pub fn trim_process_tree() -> u32 {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
+        };
+        let mut n = 0;
+        for pid in tree_pids() {
+            unsafe {
+                let Ok(h) =
+                    OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA, false, pid)
+                else {
+                    continue;
+                };
+                if EmptyWorkingSet(h).is_ok() {
+                    n += 1;
+                }
+                let _ = CloseHandle(h);
+            }
+        }
+        n
     }
 
     // ---------- WebView2 ----------
@@ -378,8 +428,11 @@ mod imp {
         false
     }
     pub fn refresh_registrations(_exe: &Path) {}
-    pub fn process_tree_memory() -> Option<(u64, u32)> {
+    pub fn process_tree_memory() -> Option<TreeMem> {
         None
+    }
+    pub fn trim_process_tree() -> u32 {
+        0
     }
     pub fn try_suspend(_webview: &wry::WebView) {}
     pub fn download(_url: &str, _dest: &Path) -> Result<(), String> {

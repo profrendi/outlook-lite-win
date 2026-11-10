@@ -4,26 +4,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
-#[serde(rename_all = "lowercase")]
+/// Keadaan pemantauan saat ini. Aplikasi selalu memakai Siaga; di luar jam kerja
+/// (bila "Hanya jam kerja" aktif) pemantauan dijeda.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
-    /// Tanpa pemantauan: Outlook hanya hidup saat jendela terbuka.
-    Mati,
-    /// Buka Outlook tersembunyi tiap N menit, baca, lalu hancurkan.
-    Hemat,
+    /// Di luar jam kerja: Outlook hanya hidup saat jendela terbuka.
+    Jeda,
     /// Outlook tersembunyi selalu hidup; notifikasi hampir real-time.
-    #[default]
     Siaga,
-}
-
-impl Mode {
-    pub fn label(self) -> &'static str {
-        match self {
-            Mode::Mati => "Mati",
-            Mode::Hemat => "Hemat",
-            Mode::Siaga => "Siaga",
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -45,8 +33,6 @@ pub struct WindowGeom {
 #[serde(default)]
 pub struct Settings {
     // --- notifikasi ---
-    pub mode: Mode,
-    pub hemat_interval_min: u32,
     pub work_hours_only: bool,
     /// "HH:MM"
     pub work_start: String,
@@ -65,6 +51,10 @@ pub struct Settings {
     pub auto_close: bool,
     pub auto_close_min: u32,
     pub low_memory: bool,
+    /// Segarkan Outlook tersembunyi bila memori WebView2 (commit) melebihi ini, dalam MB. 0 = tidak.
+    pub refresh_mb: u32,
+    /// Segarkan Outlook tersembunyi paling lambat tiap N jam (Outlook web cenderung membengkak). 0 = tidak.
+    pub refresh_hours: u32,
     pub zoom: f64,
     pub window: Option<WindowGeom>,
     pub shortcuts: Vec<Shortcut>,
@@ -80,6 +70,8 @@ pub struct Settings {
     pub diagnostics: bool,
     /// Matikan akselerasi GPU (berlaku setelah restart).
     pub no_gpu: bool,
+    /// Pisahkan iframe lintas-situs ke proses sendiri (lebih banyak proses & RAM). Berlaku setelah restart.
+    pub site_isolation: bool,
     /// Argumen tambahan WebView2 (lanjutan, berlaku setelah restart).
     pub extra_browser_args: String,
 }
@@ -87,8 +79,6 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            mode: Mode::Siaga,
-            hemat_interval_min: 15,
             work_hours_only: true,
             work_start: "08:00".into(),
             work_end: "17:00".into(),
@@ -100,6 +90,8 @@ impl Default for Settings {
             auto_close: true,
             auto_close_min: 10,
             low_memory: true,
+            refresh_mb: 700,
+            refresh_hours: 8,
             zoom: 1.0,
             window: None,
             shortcuts: vec![
@@ -120,12 +112,11 @@ impl Default for Settings {
             auto_update: true,
             diagnostics: false,
             no_gpu: false,
+            site_isolation: false,
             extra_browser_args: String::new(),
         }
     }
 }
-
-pub const HEMAT_INTERVALS: [u32; 4] = [5, 10, 15, 30];
 
 fn parse_hm(s: &str) -> Option<u32> {
     let (h, m) = s.trim().split_once(':')?;
@@ -164,7 +155,10 @@ impl Settings {
     }
 
     pub fn sanitize(&mut self) {
-        self.hemat_interval_min = self.hemat_interval_min.clamp(1, 240);
+        if self.refresh_mb != 0 {
+            self.refresh_mb = self.refresh_mb.clamp(300, 8000);
+        }
+        self.refresh_hours = self.refresh_hours.min(72);
         self.auto_close_min = self.auto_close_min.clamp(1, 240);
         if !(0.25..=4.0).contains(&self.zoom) || self.zoom.is_nan() {
             self.zoom = 1.0;
@@ -195,12 +189,12 @@ impl Settings {
         }
     }
 
-    /// Mode yang benar-benar berlaku saat ini (di luar jam kerja = Mati).
+    /// Keadaan yang berlaku saat ini (di luar jam kerja = Jeda).
     pub fn active_mode(&self, weekday: u8, minute: u32) -> Mode {
-        if self.mode == Mode::Mati || !self.in_work_hours(weekday, minute) {
-            Mode::Mati
+        if self.in_work_hours(weekday, minute) {
+            Mode::Siaga
         } else {
-            self.mode
+            Mode::Jeda
         }
     }
 
@@ -234,7 +228,7 @@ mod tests {
         assert!(s.in_work_hours(5, 16 * 60 + 59));
         assert!(!s.in_work_hours(5, 17 * 60));
         assert!(!s.in_work_hours(6, 10 * 60));
-        assert_eq!(s.active_mode(6, 600), Mode::Mati);
+        assert_eq!(s.active_mode(6, 600), Mode::Jeda);
         assert_eq!(s.active_mode(2, 600), Mode::Siaga);
 
         let mut n = s.clone();
@@ -251,9 +245,11 @@ mod tests {
 
     #[test]
     fn roundtrip_and_partial() {
-        let s: Settings = serde_json::from_str(r#"{"mode":"hemat","zoom":9}"#).unwrap();
-        assert_eq!(s.mode, Mode::Hemat);
+        // Pengaturan versi lama (mode Hemat) tetap terbaca; kunci lama diabaikan.
+        let s: Settings =
+            serde_json::from_str(r#"{"mode":"hemat","hemat_interval_min":15,"zoom":9}"#).unwrap();
         assert!(s.hotkeys);
+        assert_eq!(s.refresh_mb, 700);
         let mut s2 = s.clone();
         s2.sanitize();
         assert_eq!(s2.zoom, 1.0);

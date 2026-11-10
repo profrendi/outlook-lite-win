@@ -22,18 +22,15 @@ atau jalankan dengan argumen `--portable`.
 **Hapus instalasi**: tray > Pengaturan > *Hapus instalasi…*, atau dari Installed apps.
 Pengaturan dan data login Outlook Lite ikut dihapus.
 
-## Mode notifikasi
+## Cara kerja dan notifikasi
 
-| | Mati | Hemat | Siaga (bawaan) |
-|---|---|---|---|
-| Cara kerja | Outlook hanya hidup saat jendela terbuka | Outlook tersembunyi dibuka tiap N menit, dibaca, lalu dihancurkan | Outlook tersembunyi selalu hidup |
-| Notifikasi email | Tidak ada | Tertunda sampai N menit | Beberapa detik |
-| Pengingat rapat | Tidak ada | Tidak | Ya |
-| RAM saat jendela tertutup | ~0 (hanya tray) | ~0, lonjakan singkat tiap cek | ~300–400 MB |
-| Tombol X | Hancurkan jendela | Hancurkan jendela | Sembunyikan jendela |
+Outlook Lite selalu memakai satu cara kerja (Siaga): Outlook web tetap hidup tersembunyi
+saat jendela ditutup ke tray atau diminimalkan, jadi email baru dan pengingat rapat
+diberitahukan dalam hitungan detik. Tombol X menyembunyikan jendela ke tray.
 
-**Hanya jam kerja** (bawaan 08:00–17:00, Senin–Jumat): di luar jam itu aplikasi otomatis
-berperilaku seperti mode Mati.
+**Hanya jam kerja** (bawaan 08:00–17:00, Senin–Jumat): di luar jam itu pemantauan dijeda.
+Outlook tersembunyi ditutup (RAM ~0) dan hanya hidup saat jendela dibuka. Matikan opsi ini
+bila ingin notifikasi 24 jam.
 
 Notifikasi berasal dari beberapa sinyal yang dipancarkan Outlook web sendiri: notifikasi
 bawaan Outlook web, **suara email masuk** Outlook (sama seperti PWA), **angka badge** (sumber
@@ -69,9 +66,8 @@ Klik kiri ikon = buka jendela. Klik kanan:
 
 - **Status** (mode, jumlah belum dibaca, RAM bila diagnostik aktif)
 - Buka Email · Buka Kalender · Email baru · Pintasan · **Cek email sekarang**
-- **Notifikasi**: mode Mati/Hemat/Siaga, interval Hemat (5/10/15/30 menit), hanya jam kerja,
-  bunyi, tampilkan pengirim & subjek, **Tes notifikasi**, mode kompatibel
-- **Jendela**: tutup otomatis saat tidak aktif, hemat memori WebView2, zoom
+- **Notifikasi**: hanya jam kerja, bunyi, tampilkan pengirim & subjek, **Tes notifikasi**, mode kompatibel
+- **Jendela**: tutup otomatis saat tidak aktif, hemat RAM, tanpa GPU, zoom
 - **Pengaturan**: mulai dengan Windows, hotkey, aplikasi email default (mailto),
   update otomatis, cek update, diagnostik RAM, diagnostik halaman Outlook,
   buka folder pengaturan, buka folder aplikasi, muat ulang pengaturan, hapus instalasi
@@ -82,8 +78,7 @@ Ikon tray: **titik merah** = ada email belum dibaca, **titik kuning** = perlu lo
 ## Fitur lain
 
 - **Tutup otomatis saat tidak aktif** (bawaan 10 menit). Tidak berlaku saat sedang menulis email.
-- **Hemat memori WebView2**: target memori rendah saat tersembunyi/diminimalkan; di mode
-  Mati/Hemat halaman juga ditangguhkan saat diminimalkan.
+- **Hemat RAM** (bawaan aktif), lihat bagian di bawah.
 - **Ingat ukuran, posisi, zoom** jendela.
 - **Hotkey**: `Ctrl+Alt+O` buka/tutup jendela, `Ctrl+Alt+N` email baru. Bila sudah dipakai
   aplikasi lain, otomatis diganti kombinasi cadangan (mis. `Ctrl+Alt+M`) dan diberitahukan sekali.
@@ -95,6 +90,23 @@ Ikon tray: **titik merah** = ada email belum dibaca, **titik kuning** = perlu lo
   SHA-256. Versi baru aktif setelah restart.
 - **Single instance**: menjalankan exe lagi hanya menampilkan jendela yang ada.
 - Tautan di email dibuka di browser default Anda.
+
+## Hemat RAM
+
+| Keadaan | Yang dilakukan |
+|---|---|
+| Selalu | Tanpa proses renderer cadangan, tanpa cache halaman sebelumnya, iframe Microsoft berbagi proses dengan Outlook (lebih sedikit proses) |
+| Dipakai, tapi tidak difokus > 3 menit | WebView2 diminta memakai memori rendah; normal lagi saat jendela difokus |
+| Diminimalkan / di tray | Tampilan WebView2 dimatikan, memori rendah, lalu memori proses WebView2 dirapikan 20 detik kemudian dan tiap 15 menit |
+| Di tray berjam-jam | Outlook disegarkan otomatis bila memorinya melebihi 700 MB atau sudah berjalan 8 jam (hanya bila tersembunyi ≥ 10 menit dan tidak sedang menulis email) |
+| Di luar jam kerja | Outlook tersembunyi ditutup |
+
+Merapikan memori melepas halaman yang jarang disentuh dari RAM fisik; Windows memuatnya
+kembali saat dibutuhkan, jadi angka di Task Manager bisa naik perlahan lagi. Saat jendela
+dibuka setelah lama di tray, tampilan pertama bisa terasa sedikit lebih lambat.
+
+**Tanpa GPU** (menu Jendela, perlu restart) menghilangkan proses GPU. Hemat RAM, tapi
+gulir terasa sedikit kurang halus.
 
 ## settings.json
 
@@ -114,11 +126,15 @@ Di `%LOCALAPPDATA%\OutlookLite\settings.json`. Setelah diubah manual, pilih
     { "name": "Intranet", "url": "https://intranet.contoh.co.id/" }
   ],
   "unread_selector": null,
+  "refresh_mb": 700,
+  "refresh_hours": 8,
+  "site_isolation": false,
   "no_gpu": false
 }
 ```
 
-`no_gpu` dan `extra_browser_args` berlaku setelah aplikasi di-restart.
+`refresh_mb` / `refresh_hours` = 0 mematikan penyegaran otomatis. `site_isolation`, `no_gpu`,
+dan `extra_browser_args` berlaku setelah aplikasi di-restart.
 
 ## Diagnostik halaman (jika jumlah belum dibaca tidak terbaca)
 
@@ -140,9 +156,8 @@ Aplikasi: `%LOCALAPPDATA%\Programs\OutlookLite\outlook-lite.exe`. Data: `%LOCALA
 
 ## Batasan
 
-- Mode Hemat mendeteksi email baru dari **kenaikan** jumlah belum dibaca. Bila Anda membaca
-  email di perangkat lain di antara dua cek, email baru bisa tidak terdeteksi.
-- Pengingat rapat hanya di mode Siaga.
+- Di luar jam kerja (bila *Hanya jam kerja* aktif) tidak ada notifikasi.
+- Saat Outlook tersembunyi disegarkan, notifikasi berhenti beberapa detik selama halaman dimuat.
 - Bila sesi login kedaluwarsa, notifikasi berhenti sampai Anda login lagi (ikon kuning + toast).
 - Toast yang sudah masuk Pusat Notifikasi mungkin tidak membuka jendela saat diklik.
 

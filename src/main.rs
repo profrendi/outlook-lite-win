@@ -1,10 +1,9 @@
 //! Outlook Lite — Outlook web (outlook.office.com) di tray Windows, tanpa hak admin.
 //!
 //! Satu "instance" Outlook (jendela + WebView2) yang bisa terlihat, tersembunyi, atau
-//! tidak ada sama sekali, diatur oleh mode notifikasi:
-//! - Mati  : Outlook hanya hidup saat jendela terbuka; X = hancurkan (RAM kembali ~0).
-//! - Hemat : seperti Mati, plus cek tersembunyi tiap N menit lalu dihancurkan lagi.
-//! - Siaga : Outlook tersembunyi selalu hidup (jam kerja); X = sembunyikan.
+//! tidak ada sama sekali:
+//! - Siaga (jam kerja): Outlook tersembunyi selalu hidup; X = sembunyikan.
+//! - Jeda (di luar jam kerja): Outlook hanya hidup saat jendela terbuka; X = hancurkan.
 
 #![cfg_attr(
     all(not(debug_assertions), target_os = "windows"),
@@ -44,7 +43,7 @@ use tray_icon::{
 use wry::{NewWindowResponse, PageLoadEvent, WebContext, WebView, WebViewBuilder};
 
 use icon::Badge;
-use settings::{Mode, Settings, WindowGeom, HEMAT_INTERVALS};
+use settings::{Mode, Settings, WindowGeom};
 use urlutil::{
     is_microsoft_url, is_outlook_mail_url, is_outlook_url, CALENDAR_URL, COMPOSE_URL, MAIL_URL,
 };
@@ -52,9 +51,15 @@ use urlutil::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const INSTANCE_PORT: u16 = 47193;
 const MAGIC: &str = "OUTLOOKLITE1";
-/// Argumen bawaan wry yang harus dipertahankan saat kita menambah argumen sendiri.
-/// IntensiveWakeUpThrottling dimatikan supaya halaman tersembunyi tidak diperlambat.
-const WRY_DEFAULT_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,IntensiveWakeUpThrottling";
+/// Fitur Chromium yang dimatikan. Tiga pertama bawaan wry (harus dipertahankan).
+/// IntensiveWakeUpThrottling: halaman tersembunyi tidak diperlambat (notifikasi).
+/// SpareRendererForSitePerProcess: tanpa proses renderer cadangan yang menganggur.
+/// BackForwardCache: halaman lama tidak disimpan di memori.
+const DISABLED_FEATURES: &str = "msWebOOUI,msPdfOOUI,msSmartScreenProtection,IntensiveWakeUpThrottling,SpareRendererForSitePerProcess,BackForwardCache";
+/// Tanpa isolasi situs, iframe Microsoft lintas-domain berbagi proses dengan Outlook
+/// (lebih sedikit proses). Aman di sini karena WebView hanya memuat halaman Microsoft;
+/// tautan lain dibuka di browser default.
+const NO_SITE_ISOLATION: &str = "IsolateOrigins,site-per-process";
 /// Izinkan Outlook membunyikan suara email masuk tanpa klik pengguna (seperti PWA).
 const AUTOPLAY_ARGS: &str = "--autoplay-policy=no-user-gesture-required";
 /// Jangan perlambat halaman tersembunyi (penting untuk notifikasi di mode Siaga).
@@ -63,6 +68,17 @@ const MONITOR_JS: &str = include_str!("js/monitor.js");
 const INSPECT_JS: &str = include_str!("js/inspect.js");
 
 const TICK: Duration = Duration::from_secs(5);
+/// Rapikan memori sesaat setelah jendela disembunyikan/diminimalkan, lalu berkala.
+const TRIM_DELAY: Duration = Duration::from_secs(20);
+const TRIM_EVERY: Duration = Duration::from_secs(15 * 60);
+/// Jendela terbuka tapi tidak difokus selama ini: WebView2 diminta memakai memori rendah.
+const UNFOCUSED_LOW: Duration = Duration::from_secs(3 * 60);
+/// Cek apakah Outlook tersembunyi perlu disegarkan (memori membengkak).
+const REFRESH_CHECK_EVERY: Duration = Duration::from_secs(5 * 60);
+/// Jangan segarkan bila jendela baru saja ditutup (pengguna mungkin membukanya lagi).
+const REFRESH_MIN_HIDDEN: Duration = Duration::from_secs(10 * 60);
+/// Setelah halaman disegarkan, angka belum dibaca sempat tidak stabil: jangan dianggap email baru.
+const REFRESH_SETTLE: Duration = Duration::from_secs(90);
 const BG_CHECK_TIMEOUT: Duration = Duration::from_secs(75);
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(90);
 const CREATE_RETRY: Duration = Duration::from_secs(300);
@@ -299,6 +315,17 @@ fn serve_lock(listener: TcpListener, proxy: EventLoopProxy<UserEvent>) {
 // ---------------------------------------------------------------------------
 // Util
 
+fn browser_args_for(s: &Settings) -> String {
+    let mut features = DISABLED_FEATURES.to_string();
+    let mut extra = String::new();
+    if !s.site_isolation {
+        features.push(',');
+        features.push_str(NO_SITE_ISOLATION);
+        extra.push_str(" --disable-site-isolation-trials");
+    }
+    format!("--disable-features={features} {AUTOPLAY_ARGS} {BG_ARGS}{extra}")
+}
+
 fn data_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -356,16 +383,13 @@ mod id {
     pub const CHECK_NOW: &str = "check_now";
     pub const TEST_TOAST: &str = "test_toast";
     pub const TOAST_COMPAT: &str = "toast_compat";
-    pub const MODE_MATI: &str = "mode_mati";
-    pub const MODE_HEMAT: &str = "mode_hemat";
-    pub const MODE_SIAGA: &str = "mode_siaga";
-    pub const INTERVAL: &str = "interval:";
     pub const SHORTCUT: &str = "shortcut:";
     pub const WORK_HOURS: &str = "work_hours";
     pub const SOUND: &str = "sound";
     pub const DETAILS: &str = "details";
     pub const AUTO_CLOSE: &str = "auto_close";
     pub const LOW_MEM: &str = "low_mem";
+    pub const NO_GPU: &str = "no_gpu";
     pub const ZOOM_IN: &str = "zoom_in";
     pub const ZOOM_OUT: &str = "zoom_out";
     pub const ZOOM_RESET: &str = "zoom_reset";
@@ -387,14 +411,13 @@ mod id {
 
 struct TrayMenu {
     status: MenuItem,
-    modes: [(Mode, CheckMenuItem); 3],
-    intervals: Vec<(u32, CheckMenuItem)>,
     work_hours: CheckMenuItem,
     sound: CheckMenuItem,
     details: CheckMenuItem,
     toast_compat: CheckMenuItem,
     auto_close: CheckMenuItem,
     low_mem: CheckMenuItem,
+    no_gpu: CheckMenuItem,
     autostart: CheckMenuItem,
     hotkeys: CheckMenuItem,
     mailto: CheckMenuItem,
@@ -409,15 +432,6 @@ fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> 
     let sep = PredefinedMenuItem::separator;
 
     let status = MenuItem::with_id("status", "Outlook Lite", false, None);
-    let modes = [
-        (Mode::Mati, check(id::MODE_MATI, "Mode Mati (tanpa notifikasi)", false)),
-        (Mode::Hemat, check(id::MODE_HEMAT, "Mode Hemat (cek berkala)", false)),
-        (Mode::Siaga, check(id::MODE_SIAGA, "Mode Siaga (hampir real-time)", false)),
-    ];
-    let intervals: Vec<(u32, CheckMenuItem)> = HEMAT_INTERVALS
-        .iter()
-        .map(|m| (*m, check(&format!("{}{m}", id::INTERVAL), &format!("{m} menit"), false)))
-        .collect();
     let work_hours = check(
         id::WORK_HOURS,
         &format!("Hanya jam kerja ({})", s.work_hours_label()),
@@ -435,7 +449,8 @@ fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> 
         &format!("Tutup otomatis saat tidak aktif ({} menit)", s.auto_close_min),
         false,
     );
-    let low_mem = check(id::LOW_MEM, "Hemat memori WebView2", false);
+    let low_mem = check(id::LOW_MEM, "Hemat RAM (rapikan memori saat tersembunyi)", false);
+    let no_gpu = check(id::NO_GPU, "Tanpa GPU (hemat RAM, berlaku setelah restart)", false);
     let autostart = check(id::AUTOSTART, "Mulai dengan Windows", false);
     let hotkeys = check(id::HOTKEYS, &hotkey_label(s), false);
     let mailto = check(id::MAILTO, "Aplikasi email default (mailto)", false);
@@ -443,19 +458,10 @@ fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> 
     let diag = check(id::DIAG_RAM, "Diagnostik RAM", false);
     let restart_update = MenuItem::with_id(id::RESTART_UPDATE, "Tidak ada update", false, None);
 
-    let interval_refs: Vec<&dyn tray_icon::menu::IsMenuItem> =
-        intervals.iter().map(|(_, c)| c as &dyn tray_icon::menu::IsMenuItem).collect();
-    let interval_sub = Submenu::with_items("Interval mode Hemat", true, &interval_refs)?;
-
     let notif = Submenu::with_items(
         "Notifikasi",
         true,
         &[
-            &modes[0].1,
-            &modes[1].1,
-            &modes[2].1,
-            &sep(),
-            &interval_sub,
             &work_hours,
             &sound,
             &details,
@@ -470,6 +476,7 @@ fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> 
         &[
             &auto_close,
             &low_mem,
+            &no_gpu,
             &sep(),
             &item(id::ZOOM_IN, "Perbesar tampilan"),
             &item(id::ZOOM_OUT, "Perkecil tampilan"),
@@ -530,14 +537,13 @@ fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> 
         menu,
         TrayMenu {
             status,
-            modes,
-            intervals,
             work_hours,
             sound,
             details,
             toast_compat,
             auto_close,
             low_mem,
+            no_gpu,
             autostart,
             hotkeys,
             mailto,
@@ -604,7 +610,6 @@ struct App {
     next_tick: Instant,
     started: Instant,
     last_mode: Mode,
-    next_hemat: Option<Instant>,
     bg_deadline: Option<Instant>,
     manual_check: bool,
     inspect_pending: bool,
@@ -616,7 +621,13 @@ struct App {
     hk_toggle: Option<u32>,
     hk_compose: Option<u32>,
 
-    ram: Option<(u64, u32)>,
+    ram: Option<win::TreeMem>,
+    trim_at: Option<Instant>,
+    hidden_since: Option<Instant>,
+    page_fresh_at: Option<Instant>,
+    last_refresh_check: Option<Instant>,
+    settle_until: Option<Instant>,
+    low_unfocused: bool,
     last_diag: Option<Instant>,
 
     update_running: bool,
@@ -676,11 +687,10 @@ impl App {
     fn status_text(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         let active = self.active_mode();
-        if self.settings.mode != Mode::Mati && active == Mode::Mati {
-            parts.push(format!("{} (di luar jam kerja)", self.settings.mode.label()));
-        } else {
-            parts.push(format!("Mode {}", active.label()));
-        }
+        parts.push(match active {
+            Mode::Siaga => "Siaga".into(),
+            Mode::Jeda => "Jeda (di luar jam kerja)".into(),
+        });
         if self.needs_login {
             parts.push("perlu login".into());
         } else if let Some(n) = self.shown_unread() {
@@ -690,8 +700,12 @@ impl App {
                 "tidak ada yang belum dibaca".into()
             });
         }
-        if let Some((bytes, count)) = self.ram {
-            parts.push(format!("RAM {} MB ({count} proses)", bytes / (1024 * 1024)));
+        if let Some(m) = self.ram {
+            parts.push(format!(
+                "RAM {} MB ({} proses)",
+                m.working / (1024 * 1024),
+                m.count
+            ));
         }
         parts.join(" • ")
     }
@@ -749,18 +763,13 @@ impl App {
     fn sync_menu(&self) {
         let Some(m) = &self.menu else { return };
         let s = &self.settings;
-        for (mode, item) in &m.modes {
-            item.set_checked(*mode == s.mode);
-        }
-        for (min, item) in &m.intervals {
-            item.set_checked(*min == s.hemat_interval_min);
-        }
         m.work_hours.set_checked(s.work_hours_only);
         m.sound.set_checked(s.sound);
         m.details.set_checked(s.show_details);
         m.toast_compat.set_checked(s.toast_compat);
         m.auto_close.set_checked(s.auto_close);
         m.low_mem.set_checked(s.low_memory);
+        m.no_gpu.set_checked(s.no_gpu);
         m.autostart.set_checked(s.autostart);
         m.hotkeys.set_checked(s.hotkeys);
         m.mailto.set_checked(win::mailto_registered());
@@ -1045,6 +1054,11 @@ impl App {
         self.overlay_on = false;
         self.focused = false;
         self.unfocused_since = visible.then(Instant::now);
+        self.low_unfocused = false;
+        self.page_fresh_at = Some(Instant::now());
+        self.hidden_since = (!visible).then(Instant::now);
+        // Rapikan setelah Outlook selesai dimuat.
+        self.trim_at = (!visible).then(|| Instant::now() + TRIM_DELAY * 4);
         self.inst = Some(Instance {
             window,
             webview,
@@ -1068,6 +1082,9 @@ impl App {
         self.composing = false;
         self.focused = false;
         self.unfocused_since = None;
+        self.trim_at = None;
+        self.hidden_since = None;
+        self.low_unfocused = false;
     }
 
     fn show(&mut self, target: &EventLoopWindowTarget<UserEvent>, url: Option<&str>) {
@@ -1093,6 +1110,9 @@ impl App {
             set_memory_low(&inst.webview, false);
             inst.window.set_focus();
             self.unfocused_since = Some(Instant::now());
+            self.low_unfocused = false;
+            self.trim_at = None;
+            self.hidden_since = None;
             self.refresh_tray();
         } else {
             self.create_instance(target, url.unwrap_or(MAIL_URL), true);
@@ -1125,6 +1145,8 @@ impl App {
             }
             self.focused = false;
             self.unfocused_since = None;
+            self.hidden_since = Some(Instant::now());
+            self.trim_at = Some(Instant::now() + TRIM_DELAY);
         } else {
             self.destroy_instance();
         }
@@ -1168,17 +1190,20 @@ impl App {
     }
 
     fn on_resized(&mut self) {
-        let mati = self.active_mode() == Mode::Mati;
+        let jeda = self.active_mode() == Mode::Jeda;
         let low = self.settings.low_memory;
         let Some(inst) = self.inst.as_mut() else { return };
         if inst.window.is_minimized() {
             if !inst.minimized {
                 inst.minimized = true;
                 if low {
+                    // Seperti saat ditutup ke tray: WebView2 tahu halaman tidak terlihat
+                    // dan melepas memori tampilan, tapi halaman tetap memantau.
+                    let _ = inst.webview.set_visible(false);
                     set_memory_low(&inst.webview, true);
-                    // Halaman hanya ditidurkan di mode Mati; Hemat & Siaga tetap memantau.
-                    if mati {
-                        let _ = inst.webview.set_visible(false);
+                    self.trim_at = Some(Instant::now() + TRIM_DELAY);
+                    // Di luar jam kerja halaman sekalian ditidurkan.
+                    if jeda {
                         win::try_suspend(&inst.webview);
                         inst.suspended = true;
                     }
@@ -1187,11 +1212,11 @@ impl App {
         } else {
             if inst.minimized {
                 inst.minimized = false;
-                if inst.suspended {
-                    let _ = inst.webview.set_visible(true); // otomatis melanjutkan halaman
-                    inst.suspended = false;
-                }
+                let _ = inst.webview.set_visible(true); // juga melanjutkan halaman yang ditidurkan
+                inst.suspended = false;
                 set_memory_low(&inst.webview, false);
+                self.low_unfocused = false;
+                self.trim_at = None;
             }
             self.record_geom();
         }
@@ -1257,7 +1282,82 @@ impl App {
         }
     }
 
-    /// Lanjutkan halaman yang ditangguhkan (minimize di mode Mati).
+    /// Hemat RAM berkala (dipanggil dari tick).
+    fn manage_memory(&mut self, now: Instant) {
+        if !self.settings.low_memory {
+            return;
+        }
+        let Some(inst) = &self.inst else { return };
+        let (visible, minimized) = (inst.visible, inst.minimized);
+
+        // Jendela terbuka tapi lama tidak dipakai: minta WebView2 berhemat.
+        if visible
+            && !minimized
+            && !self.focused
+            && !self.low_unfocused
+            && self.unfocused_since.is_some_and(|t| t.elapsed() >= UNFOCUSED_LOW)
+        {
+            set_memory_low(&inst.webview, true);
+            self.low_unfocused = true;
+        }
+
+        let idle = !visible || minimized;
+        if !idle {
+            return;
+        }
+
+        // Rapikan working set proses WebView2.
+        if let Some(t) = self.trim_at {
+            if now >= t {
+                let n = win::trim_process_tree();
+                if self.settings.diagnostics {
+                    self.log(&format!("memori dirapikan ({n} proses)"));
+                }
+                self.trim_at = Some(now + TRIM_EVERY);
+            } else {
+                self.next_tick = self.next_tick.min(t);
+            }
+        }
+
+        // Outlook web membengkak bila berjalan berjam-jam: segarkan saat tersembunyi.
+        let hidden_long = !visible
+            && self.hidden_since.is_some_and(|t| t.elapsed() >= REFRESH_MIN_HIDDEN);
+        let check_due = self
+            .last_refresh_check
+            .is_none_or(|t| t.elapsed() >= REFRESH_CHECK_EVERY);
+        if !hidden_long
+            || !check_due
+            || self.composing
+            || self.bg_deadline.is_some()
+            || self.inspect_pending
+            || self.needs_login
+        {
+            return;
+        }
+        self.last_refresh_check = Some(now);
+        let s = &self.settings;
+        let mem = win::process_tree_memory();
+        let commit_mb = mem.map(|m| m.commit / (1024 * 1024)).unwrap_or(0);
+        let too_big = s.refresh_mb > 0 && commit_mb > s.refresh_mb as u64;
+        let too_old = s.refresh_hours > 0
+            && self
+                .page_fresh_at
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(s.refresh_hours as u64 * 3600));
+        if too_big || too_old {
+            self.log(&format!(
+                "Outlook tersembunyi disegarkan ({}; memori {commit_mb} MB)",
+                if too_big { "memori besar" } else { "berjalan lama" }
+            ));
+            if let Some(inst) = &self.inst {
+                let _ = inst.webview.load_url(MAIL_URL);
+            }
+            self.page_fresh_at = Some(now);
+            self.settle_until = Some(now + REFRESH_SETTLE);
+            self.trim_at = Some(now + TRIM_DELAY * 4);
+        }
+    }
+
+    /// Lanjutkan halaman yang ditangguhkan (minimize di luar jam kerja).
     fn wake_page(&mut self) {
         if let Some(inst) = self.inst.as_mut() {
             if inst.suspended {
@@ -1285,7 +1385,9 @@ impl App {
 
     /// Jumlah belum dibaca berubah (badge atau halaman).
     fn note_count(&mut self, prev: Option<i64>, total: i64) {
-        self.mail.on_count(prev, total, Instant::now());
+        // Sesaat setelah Outlook disegarkan, angka bisa naik-turun saat halaman dimuat.
+        let settling = self.settle_until.is_some_and(|t| Instant::now() < t);
+        self.mail.on_count(if settling { None } else { prev }, total, Instant::now());
         self.schedule_mail_flush();
     }
 
@@ -1337,7 +1439,7 @@ impl App {
     fn finish_bg_check(&mut self) {
         self.bg_deadline = None;
         let hidden = self.inst.as_ref().is_some_and(|i| !i.visible);
-        if hidden && self.active_mode() != Mode::Siaga && !self.inspect_pending {
+        if hidden && self.active_mode() == Mode::Jeda && !self.inspect_pending {
             self.destroy_instance();
         }
     }
@@ -1563,34 +1665,22 @@ impl App {
         let now = Instant::now();
         self.next_tick = now + TICK;
         let mode = self.active_mode();
-        let interval = Duration::from_secs(self.settings.hemat_interval_min as u64 * 60);
-
         if mode != self.last_mode {
             self.last_mode = mode;
-            self.next_hemat = None;
         }
 
-        match mode {
-            Mode::Siaga => {
-                let can_retry = self
-                    .create_failed_at
-                    .is_none_or(|t| t.elapsed() >= CREATE_RETRY);
-                if self.inst.is_none() && can_retry {
-                    self.create_instance(target, MAIL_URL, false);
-                }
+        if mode == Mode::Siaga {
+            let can_retry = self
+                .create_failed_at
+                .is_none_or(|t| t.elapsed() >= CREATE_RETRY);
+            if self.inst.is_none() && can_retry {
+                self.create_instance(target, MAIL_URL, false);
             }
-            Mode::Hemat => {
-                let due = *self.next_hemat.get_or_insert(now + interval);
-                if now >= due {
-                    self.next_hemat = Some(now + interval);
-                    self.start_bg_check(target, false);
-                }
-            }
-            Mode::Mati => {}
         }
 
         self.check_login_stuck();
         self.flush_mail_alert();
+        self.manage_memory(now);
 
         // Batas waktu cek/diagnostik tersembunyi.
         if self.bg_deadline.is_some_and(|d| now >= d) {
@@ -1618,7 +1708,7 @@ impl App {
 
         // Jendela tersembunyi yang tidak lagi dibutuhkan (mis. jam kerja selesai).
         let hidden = self.inst.as_ref().is_some_and(|i| !i.visible);
-        if hidden && mode != Mode::Siaga && self.bg_deadline.is_none() && !self.inspect_pending {
+        if hidden && mode == Mode::Jeda && self.bg_deadline.is_none() && !self.inspect_pending {
             self.destroy_instance();
             self.refresh_tray();
         }
@@ -1679,9 +1769,6 @@ impl App {
                 changed = false;
                 self.start_bg_check(target, true)
             }
-            id::MODE_MATI => self.settings.mode = Mode::Mati,
-            id::MODE_HEMAT => self.settings.mode = Mode::Hemat,
-            id::MODE_SIAGA => self.settings.mode = Mode::Siaga,
             id::WORK_HOURS => self.settings.work_hours_only = !self.settings.work_hours_only,
             id::SOUND => self.settings.sound = !self.settings.sound,
             id::DETAILS => self.settings.show_details = !self.settings.show_details,
@@ -1704,6 +1791,14 @@ impl App {
             }
             id::AUTO_CLOSE => self.settings.auto_close = !self.settings.auto_close,
             id::LOW_MEM => self.settings.low_memory = !self.settings.low_memory,
+            id::NO_GPU => {
+                self.settings.no_gpu = !self.settings.no_gpu;
+                self.save();
+                changed = false;
+                if win::confirm("Pengaturan GPU berlaku setelah restart. Restart Outlook Lite sekarang?") {
+                    self.restart();
+                }
+            }
             id::ZOOM_IN | id::ZOOM_OUT | id::ZOOM_RESET => {
                 let z = match mid {
                     id::ZOOM_IN => self.settings.zoom + 0.1,
@@ -1804,13 +1899,7 @@ impl App {
             }
             other => {
                 changed = false;
-                if let Some(m) = other.strip_prefix(id::INTERVAL) {
-                    if let Ok(m) = m.parse::<u32>() {
-                        self.settings.hemat_interval_min = m;
-                        self.next_hemat = None;
-                        changed = true;
-                    }
-                } else if let Some(i) = other.strip_prefix(id::SHORTCUT) {
+                if let Some(i) = other.strip_prefix(id::SHORTCUT) {
                     if let Some(sc) = i
                         .parse::<usize>()
                         .ok()
@@ -1852,6 +1941,12 @@ impl App {
                 WindowEvent::Focused(f) => {
                     self.focused = f;
                     self.unfocused_since = if f { None } else { Some(Instant::now()) };
+                    if f && self.low_unfocused {
+                        self.low_unfocused = false;
+                        if let Some(i) = &self.inst {
+                            set_memory_low(&i.webview, false);
+                        }
+                    }
                 }
                 WindowEvent::Resized(_) => self.on_resized(),
                 WindowEvent::Moved(_) => self.record_geom(),
@@ -2024,7 +2119,7 @@ fn main() {
     win::init_identity(icon_png.as_deref());
     win::refresh_registrations(&exe);
 
-    let mut browser_args = format!("{WRY_DEFAULT_ARGS} {AUTOPLAY_ARGS} {BG_ARGS}");
+    let mut browser_args = browser_args_for(&settings);
     if settings.no_gpu {
         browser_args.push_str(" --disable-gpu");
     }
@@ -2062,8 +2157,7 @@ fn main() {
         last_title: String::new(),
         next_tick: Instant::now() + TICK,
         started: Instant::now(),
-        last_mode: Mode::Mati,
-        next_hemat: None,
+        last_mode: Mode::Jeda,
         bg_deadline: None,
         manual_check: false,
         inspect_pending: false,
@@ -2074,6 +2168,12 @@ fn main() {
         hk_toggle: None,
         hk_compose: None,
         ram: None,
+        trim_at: None,
+        hidden_since: None,
+        page_fresh_at: None,
+        last_refresh_check: None,
+        settle_until: None,
+        low_unfocused: false,
         last_diag: None,
         update_running: false,
         last_update_check: None,
