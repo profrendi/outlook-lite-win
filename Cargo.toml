@@ -1,0 +1,37 @@
+[package]
+name = "outlook-lite"
+version = "0.1.0"
+edition = "2021"
+description = "Shell Outlook web ringan untuk Windows: tray, notifikasi, tanpa hak admin"
+license = "MIT"
+
+[dependencies]
+tao = "0.37"
+wry = "0.57"
+tray-icon = "0.26"
+global-hotkey = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+tauri-winrt-notification = "0.8"
+sha2 = "0.10"
+webview2-com = "0.39"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_Urlmon",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,0 +1,56 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -ne "v$ver") {
+            throw "Tag ${{ github.ref_name }} tidak sama dengan versi Cargo.toml (v$ver)"
+          }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/outlook-lite.exe dist/outlook-lite.exe
+          $hash = (Get-FileHash dist/outlook-lite.exe -Algorithm SHA256).Hash.ToLower()
+          $url = "https://github.com/${{ github.repository }}/releases/download/v$ver/outlook-lite.exe"
+          [ordered]@{ version = $ver; url = $url; sha256 = $hash } |
+            ConvertTo-Json | Set-Content -Encoding utf8NoBOM dist/latest.json
+          Get-Content dist/latest.json
+          "{0:N0} KB" -f ((Get-Item dist/outlook-lite.exe).Length / 1KB)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: outlook-lite-windows
+          path: dist/*
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/outlook-lite.exe
+            dist/latest.json
