@@ -123,4 +123,4 @@ Semua di `%LOCALAPPDATA%\OutlookLite\`: `settings.json`, `outlook-lite.log`,
 ## Build sendiri
 
 GitHub Actions membangun setiap push. Rilis dibuat dengan tag yang sama dengan versi di
-`Cargo.toml`, mis. `git tag v0.1.0 && git push --tags`. Lokal di Windows: `cargo build --release`.
+`Cargo.toml`: di GitHub buka *Releases > Draft a new release*, buat tag `v0.1.0`, lalu *Publish*. Actions akan melampirkan `outlook-lite.exe` dan `latest.json` (dibutuhkan update otomatis). Lokal di Windows: `cargo build --release`.
