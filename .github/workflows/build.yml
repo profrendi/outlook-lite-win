@@ -6,9 +6,16 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+  # Rilis yang diterbitkan dari halaman web GitHub juga membangun dan melampirkan file.
+  release:
+    types: [published]
 
 permissions:
   contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   windows:
