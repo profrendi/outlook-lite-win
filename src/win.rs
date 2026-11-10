@@ -13,6 +13,8 @@ pub type Callback = Arc<dyn Fn() + Send + Sync>;
 pub struct ToastSpec {
     pub title: String,
     pub body: String,
+    /// Baris kedua (kosong = tidak ada).
+    pub body2: String,
     pub sound: bool,
     /// Pakai identitas PowerShell yang selalu terdaftar di Windows.
     pub compat: bool,
@@ -139,6 +141,9 @@ mod imp {
         use tauri_winrt_notification::{IconCrop, Sound, Toast};
         let build = |app_id: &str| {
             let mut t = Toast::new(app_id).title(&spec.title).text1(&spec.body);
+            if !spec.body2.is_empty() {
+                t = t.text2(&spec.body2);
+            }
             t = t.sound(if spec.sound { Some(Sound::Mail) } else { None });
             if let Some(p) = icon {
                 t = t.icon(p, IconCrop::Square, "");
@@ -357,7 +362,7 @@ mod imp {
     }
     pub fn init_identity(_icon_png: Option<&Path>) {}
     pub fn toast(spec: &ToastSpec, _icon: Option<&Path>) {
-        eprintln!("[toast] {} — {}", spec.title, spec.body);
+        eprintln!("[toast] {} — {} {}", spec.title, spec.body, spec.body2);
     }
     pub fn set_autostart(_enabled: bool, _exe: &Path) -> std::io::Result<()> {
         Ok(())

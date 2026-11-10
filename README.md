@@ -35,13 +35,24 @@ Pengaturan dan data login Outlook Lite ikut dihapus.
 **Hanya jam kerja** (bawaan 08:00–17:00, Senin–Jumat): di luar jam itu aplikasi otomatis
 berperilaku seperti mode Mati.
 
-Notifikasi berasal dari beberapa sinyal yang dipancarkan Outlook web sendiri:
-- **Notifikasi bawaan Outlook web** (email baru, pengingat rapat) diteruskan menjadi toast
-  Windows. Pastikan di Outlook web: *Pengaturan > Umum > Pemberitahuan* → pemberitahuan
-  desktop aktif.
-- **Suara email masuk** Outlook (sama seperti PWA) dan **angka badge** (sumber tanda merah
-  di taskbar). Suara Outlook ikut berbunyi; toast dari sinyal ini tidak menambah suara kedua.
-- **Jumlah belum dibaca di Inbox**, sebagai cadangan.
+Notifikasi berasal dari beberapa sinyal yang dipancarkan Outlook web sendiri: notifikasi
+bawaan Outlook web, **suara email masuk** Outlook (sama seperti PWA), **angka badge** (sumber
+tanda merah di taskbar), dan **jumlah belum dibaca di Inbox**. Pastikan di Outlook web:
+*Pengaturan > Umum > Pemberitahuan* → pemberitahuan desktop aktif.
+
+Semua sinyal dalam beberapa detik digabung menjadi **satu toast**:
+
+```
+3 email baru
+Belum dibaca di Inbox: 15
+```
+
+- Baris atas: jumlah email yang baru masuk (email beruntun digabung).
+- Baris bawah: total belum dibaca di Inbox, sudah termasuk email baru itu.
+- Bila jumlah belum dibaca tidak terbaca, toast hanya berisi *"Email baru"*.
+- Notifikasi Outlook tanpa kenaikan jumlah (biasanya pengingat rapat) tampil sebagai toast
+  *"Outlook"* terpisah.
+- Suara Outlook ikut berbunyi; toast tidak menambah suara kedua.
 
 Tanda merah juga muncul di ikon taskbar selama jendela terbuka atau diminimalkan.
 
@@ -49,8 +60,8 @@ Gunakan **Tes notifikasi** setelah instal. Jika toast tidak muncul, centang
 *Mode kompatibel*: toast dikirim memakai identitas PowerShell (tampil sebagai
 "Windows PowerShell") yang selalu terdaftar di Windows.
 
-Demi privasi mailbox, toast bawaan hanya berisi *"Ada email baru atau pengingat rapat"*.
-Aktifkan *Tampilkan pengirim & subjek* bila ingin detail.
+Demi privasi mailbox, toast tidak berisi pengirim atau subjek. Aktifkan *Tampilkan pengirim
+& subjek* bila ingin detail: untuk satu email baru baris atas menjadi *"Dari X"* diikuti subjek.
 
 ## Menu tray
 

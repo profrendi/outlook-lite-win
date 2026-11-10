@@ -15,6 +15,7 @@
 
 mod icon;
 mod install;
+mod mailalert;
 mod settings;
 mod update;
 mod urlutil;
@@ -65,7 +66,6 @@ const TICK: Duration = Duration::from_secs(5);
 const BG_CHECK_TIMEOUT: Duration = Duration::from_secs(75);
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(90);
 const CREATE_RETRY: Duration = Duration::from_secs(300);
-const HOOK_SUPPRESS: Duration = Duration::from_secs(20);
 const UPDATE_EVERY: Duration = Duration::from_secs(24 * 3600);
 const UPDATE_FIRST_DELAY: Duration = Duration::from_secs(90);
 const DIAG_EVERY: Duration = Duration::from_secs(10);
@@ -73,8 +73,6 @@ const DIAG_EVERY: Duration = Duration::from_secs(10);
 const LOGIN_GRACE: Duration = Duration::from_secs(120);
 /// Peringatan "perlu login" paling sering sekali per jangka waktu ini.
 const LOGIN_TOAST_COOLDOWN: Duration = Duration::from_secs(3 * 3600);
-/// Jeda setelah suara Outlook sebelum toast, menunggu sinyal yang lebih lengkap.
-const SOUND_WAIT: Duration = Duration::from_millis(2500);
 
 // ---------------------------------------------------------------------------
 // Event
@@ -593,9 +591,8 @@ struct App {
 
     unread: Option<i64>,
     badge_unread: Option<i64>,
-    last_alert: Option<Instant>,
     last_sound: Option<Instant>,
-    pending_sound: Option<Instant>,
+    mail: mailalert::Tracker,
     last_login_toast: Option<Instant>,
     overlay_on: bool,
     needs_login: bool,
@@ -653,6 +650,10 @@ impl App {
     // ----- notifikasi -----
 
     fn toast(&self, title: &str, body: &str, click: Option<u64>, force_sound: Option<bool>) {
+        self.toast3(title, body, "", click, force_sound);
+    }
+
+    fn toast3(&self, title: &str, body: &str, body2: &str, click: Option<u64>, force_sound: Option<bool>) {
         let proxy = self.proxy.clone();
         let cb: win::Callback = Arc::new(move || {
             let _ = proxy.send_event(UserEvent::ToastClick(click));
@@ -661,6 +662,7 @@ impl App {
             &win::ToastSpec {
                 title: title.to_string(),
                 body: body.to_string(),
+                body2: body2.to_string(),
                 sound: force_sound.unwrap_or(self.settings.sound),
                 compat: self.settings.toast_compat,
                 on_click: Some(cb),
@@ -1270,80 +1272,62 @@ impl App {
         self.badge_unread.or(self.unread)
     }
 
-    fn alert_recent(&self) -> bool {
-        self.last_alert.is_some_and(|t| t.elapsed() < HOOK_SUPPRESS)
-    }
-
     fn sound_recent(&self) -> bool {
         self.last_sound.is_some_and(|t| t.elapsed() < Duration::from_secs(10))
     }
 
-    /// Toast "email baru" dari kenaikan angka (badge atau halaman).
-    fn alert_count_increase(&mut self, new: i64, total: i64) {
-        if self.alert_recent() || self.user_looking() {
-            return;
+    /// Jadwalkan tick saat batch email masuk perlu ditutup.
+    fn schedule_mail_flush(&mut self) {
+        if let Some(b) = self.mail.batch() {
+            self.next_tick = self.next_tick.min(b.due_at());
         }
-        self.pending_sound = None;
-        self.last_alert = Some(Instant::now());
-        let title = if new == 1 {
-            "1 email baru".to_string()
-        } else {
-            format!("{new} email baru")
-        };
-        // Outlook sudah membunyikan suaranya sendiri: jangan dobel.
-        let sound = (!self.sound_recent()).then_some(self.settings.sound);
-        self.toast(
-            &title,
-            &format!("Total {total} belum dibaca. Klik untuk membuka."),
-            None,
-            Some(sound.unwrap_or(false)),
-        );
+    }
+
+    /// Jumlah belum dibaca berubah (badge atau halaman).
+    fn note_count(&mut self, prev: Option<i64>, total: i64) {
+        self.mail.on_count(prev, total, Instant::now());
+        self.schedule_mail_flush();
     }
 
     fn on_badge(&mut self, count: i64) {
         let prev = self.badge_unread;
         self.badge_unread = Some(count);
         self.login_seen_at = None;
-        if let Some(p) = prev {
-            if count > p {
-                self.alert_count_increase(count - p, count);
-            }
-        }
+        self.note_count(prev, count);
         self.refresh_tray();
     }
 
     fn on_sound(&mut self) {
         self.last_sound = Some(Instant::now());
-        if self.alert_recent() || self.user_looking() {
-            return;
-        }
-        // Tunggu sebentar: badge/notifikasi Outlook biasanya menyusul dengan info lebih lengkap.
-        self.pending_sound = Some(Instant::now());
-        self.next_tick = self.next_tick.min(Instant::now() + SOUND_WAIT);
+        self.mail.on_sound(self.shown_unread(), Instant::now());
+        self.schedule_mail_flush();
     }
 
-    fn flush_pending_sound(&mut self) {
-        let Some(t) = self.pending_sound else { return };
-        if t.elapsed() < SOUND_WAIT {
-            self.next_tick = self.next_tick.min(t + SOUND_WAIT);
+    /// Tutup batch email masuk bila waktunya, lalu tampilkan satu toast:
+    /// baris atas jumlah email baru, baris bawah total belum dibaca.
+    fn flush_mail_alert(&mut self) {
+        let outlook_sound = self.mail.batch().is_some_and(|b| b.outlook_played_sound());
+        let Some(alert) = self.mail.take_due(Instant::now()) else {
+            self.schedule_mail_flush();
+            return;
+        };
+        if self.user_looking() {
             return;
         }
-        self.pending_sound = None;
-        if self.alert_recent() || self.user_looking() {
-            return;
-        }
-        self.last_alert = Some(Instant::now());
-        self.toast(
-            "Outlook",
-            "Ada email baru atau pengingat rapat. Klik untuk membuka.",
-            None,
-            Some(false), // suara sudah dibunyikan Outlook
-        );
+        let click = match &alert {
+            mailalert::Alert::Mail { notice, .. } => notice.as_ref().map(|n| n.id),
+            mailalert::Alert::Other { notice, .. } => Some(notice.id),
+        };
+        let (title, l1, l2) = mailalert::texts(&alert, self.settings.show_details);
+        // Outlook sudah membunyikan suaranya sendiri: jangan dobel.
+        let sound = self.settings.sound && !outlook_sound && !self.sound_recent();
+        self.log(&format!("toast: {title} / {l1}"));
+        self.toast3(&title, &l1, &l2, click, Some(sound));
     }
 
     fn report_manual(&self, n: i64) {
         let body = if n > 0 {
-            format!("{n} email belum dibaca di Inbox.")
+            format!("Belum dibaca di Inbox: {n}")
         } else {
             "Tidak ada email belum dibaca di Inbox.".into()
         };
@@ -1376,11 +1360,7 @@ impl App {
             self.unread = Some(unread);
             // Bila Outlook memberi angka badge, itu yang dipakai untuk peringatan.
             if self.badge_unread.is_none() {
-                if let Some(p) = prev {
-                    if unread > p {
-                        self.alert_count_increase(unread - p, unread);
-                    }
-                }
+                self.note_count(prev, unread);
             }
             if self.manual_check {
                 self.manual_check = false;
@@ -1394,24 +1374,9 @@ impl App {
     }
 
     fn on_notify(&mut self, id: u64, title: String, body: String) {
-        if self.user_looking() {
-            return;
-        }
-        self.pending_sound = None;
-        self.last_alert = Some(Instant::now());
-        let sound = !self.sound_recent() && self.settings.sound;
-        let (t, b) = if self.settings.show_details {
-            (
-                if title.is_empty() { "Outlook".to_string() } else { title },
-                body,
-            )
-        } else {
-            (
-                "Outlook".to_string(),
-                "Ada email baru atau pengingat rapat. Klik untuk membuka.".to_string(),
-            )
-        };
-        self.toast(&t, &b, Some(id), Some(sound));
+        let notice = mailalert::Notice { id, title, body };
+        self.mail.on_notice(notice, self.shown_unread(), Instant::now());
+        self.schedule_mail_flush();
     }
 
     fn on_page_loaded(&mut self, url: String) {
@@ -1625,7 +1590,7 @@ impl App {
         }
 
         self.check_login_stuck();
-        self.flush_pending_sound();
+        self.flush_mail_alert();
 
         // Batas waktu cek/diagnostik tersembunyi.
         if self.bg_deadline.is_some_and(|d| now >= d) {
@@ -1723,9 +1688,16 @@ impl App {
             id::TOAST_COMPAT => self.settings.toast_compat = !self.settings.toast_compat,
             id::TEST_TOAST => {
                 changed = false;
-                self.toast(
-                    "Tes notifikasi Outlook Lite",
-                    "Jika Anda melihat ini, notifikasi berfungsi. Klik untuk membuka Outlook.",
+                // Contoh bentuk toast email masuk, dengan angka belum dibaca saat ini.
+                let total = self.shown_unread().map(|n| n.max(0) + 1);
+                let (title, l1, _) = mailalert::texts(
+                    &mailalert::Alert::Mail { new: Some(1), total, notice: None },
+                    false,
+                );
+                self.toast3(
+                    &format!("[Tes] {title}"),
+                    &l1,
+                    "Notifikasi berfungsi. Klik untuk membuka Outlook.",
                     None,
                     None,
                 );
@@ -2079,9 +2051,8 @@ fn main() {
         composing: false,
         unread: None,
         badge_unread: None,
-        last_alert: None,
         last_sound: None,
-        pending_sound: None,
+        mail: mailalert::Tracker::default(),
         last_login_toast: None,
         overlay_on: false,
         needs_login: false,
