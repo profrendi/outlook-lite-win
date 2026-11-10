@@ -249,6 +249,13 @@
   }
   // Dipanggil aplikasi saat email masuk dan "Cek email sekarang": baca ulang segera.
   window.__oliteForce = () => tick(true);
-  setInterval(() => tick(false), 3000);
+  // Saat tersembunyi (tray/minimize) panel folder cukup dibaca tiap 9 detik: email masuk tetap
+  // terdeteksi seketika lewat suara/badge/notifikasi, dan aplikasi lalu meminta baca ulang.
+  let n = 0;
+  setInterval(() => {
+    n++;
+    if (document.hidden && n % 3 !== 0) return;
+    tick(false);
+  }, 3000);
   document.addEventListener('DOMContentLoaded', () => setTimeout(() => tick(false), 500));
 })();

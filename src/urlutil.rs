@@ -26,6 +26,15 @@ fn host_matches(host: &str, domains: &[&str]) -> bool {
         .any(|d| host == *d || host.ends_with(&format!(".{d}")))
 }
 
+/// Apakah `host` sama dengan salah satu pola. Pola `*.contoh.com` cocok dengan subdomainnya.
+pub fn host_matches_pattern(host: &str, patterns: &[&str]) -> bool {
+    let h = host.to_ascii_lowercase();
+    patterns.iter().any(|p| match p.strip_prefix("*.") {
+        Some(base) => h.ends_with(&format!(".{base}")),
+        None => h == *p,
+    })
+}
+
 /// Domain Microsoft yang boleh dibuka sebagai popup di dalam aplikasi (login, compose pop-out).
 pub fn is_microsoft_url(url: &str) -> bool {
     if !url.starts_with("https://") {
@@ -173,6 +182,15 @@ pub fn mailto_to_compose(mailto: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_patterns() {
+        let p = ["*.events.data.microsoft.com", "browser.pipe.aria.microsoft.com"];
+        assert!(host_matches_pattern("browser.events.data.microsoft.com", &p));
+        assert!(host_matches_pattern("Browser.Pipe.Aria.Microsoft.com", &p));
+        assert!(!host_matches_pattern("events.data.microsoft.com.evil.com", &p));
+        assert!(!host_matches_pattern("outlook.cloud.microsoft", &p));
+    }
 
     #[test]
     fn hosts() {

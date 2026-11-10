@@ -58,7 +58,13 @@ const MAGIC: &str = "OUTLOOKLITE1";
 /// IntensiveWakeUpThrottling: halaman tersembunyi tidak diperlambat (notifikasi).
 /// SpareRendererForSitePerProcess: tanpa proses renderer cadangan yang menganggur.
 /// BackForwardCache: halaman lama tidak disimpan di memori.
-const DISABLED_FEATURES: &str = "msWebOOUI,msPdfOOUI,msSmartScreenProtection,IntensiveWakeUpThrottling,SpareRendererForSitePerProcess,BackForwardCache";
+const DISABLED_FEATURES: &str = "msWebOOUI,msPdfOOUI,msSmartScreenProtection,IntensiveWakeUpThrottling,SpareRendererForSitePerProcess,BackForwardCache,Translate,MediaRouter,OptimizationHints,AutofillServerCommunication";
+/// Telemetri Outlook web/Office (pengukuran pemakaian ke Microsoft). Tidak dibutuhkan untuk
+/// email; diblokir di dalam WebView2 supaya tidak ada kerja jaringan & CPU tambahan.
+const TELEMETRY_HOSTS: &[&str] = &[
+    "*.events.data.microsoft.com",
+    "browser.pipe.aria.microsoft.com",
+];
 /// Tanpa isolasi situs, iframe Microsoft lintas-domain berbagi proses dengan Outlook
 /// (lebih sedikit proses). Aman di sini karena WebView hanya memuat halaman Microsoft;
 /// tautan lain dibuka di browser default.
@@ -74,6 +80,10 @@ const TICK: Duration = Duration::from_secs(5);
 /// Rapikan memori sesaat setelah jendela disembunyikan/diminimalkan, lalu berkala.
 const TRIM_DELAY: Duration = Duration::from_secs(20);
 const TRIM_EVERY: Duration = Duration::from_secs(5 * 60);
+/// Saat tersembunyi/diminimalkan, RAM diperiksa tiap ini; dirapikan bila melewati `trim_ws_mb`.
+const TRIM_CHECK: Duration = Duration::from_secs(30);
+/// Jeda minimum antar perapian otomatis (merapikan terlalu sering hanya memindah halaman bolak-balik).
+const TRIM_MIN_GAP: Duration = Duration::from_secs(60);
 /// Jendela terbuka tapi tidak difokus selama ini: WebView2 diminta memakai memori rendah.
 const UNFOCUSED_LOW: Duration = Duration::from_secs(60);
 /// Cek apakah Outlook tersembunyi perlu disegarkan (memori membengkak).
@@ -353,6 +363,12 @@ fn browser_args_for(s: &Settings) -> String {
         features.push(',');
         features.push_str(NO_SITE_ISOLATION);
         extra.push_str(" --disable-site-isolation-trials");
+    }
+    // Tanpa layanan jaringan latar Chromium (pembaruan komponen, dsb.).
+    extra.push_str(" --disable-background-networking");
+    if s.low_end_mode {
+        // Mode perangkat RAM kecil Chromium: cache gambar/grafis lebih kecil.
+        extra.push_str(" --enable-low-end-device-mode");
     }
     if s.v8_optimize_for_size {
         // V8 mengutamakan ukuran memori dibanding kecepatan (Outlook tetap lancar).
@@ -679,6 +695,9 @@ struct App {
     last_refresh_check: Option<Instant>,
     settle_until: Option<Instant>,
     low_unfocused: bool,
+    next_trim_check: Option<Instant>,
+    last_trim: Option<Instant>,
+    background_mode: bool,
 
     update_running: bool,
     last_update_check: Option<Instant>,
@@ -1098,6 +1117,10 @@ impl App {
             }
         };
         let _ = webview.zoom(zoom);
+        win::tune_webview(
+            &webview,
+            if self.settings.block_telemetry { TELEMETRY_HOSTS } else { &[] },
+        );
         {
             let p = self.proxy.clone();
             win::on_process_failed(&webview, move |k| {
@@ -1148,6 +1171,8 @@ impl App {
         self.trim_at = None;
         self.hidden_since = None;
         self.low_unfocused = false;
+        self.background_mode = false;
+        self.next_trim_check = None;
     }
 
     fn show(&mut self, target: &EventLoopWindowTarget<UserEvent>, url: Option<&str>) {
@@ -1178,6 +1203,7 @@ impl App {
             inst.window.set_focus();
             self.unfocused_since = Some(Instant::now());
             self.low_unfocused = false;
+            self.leave_background_mode();
             self.trim_at = None;
             self.hidden_since = None;
             self.refresh_tray();
@@ -1288,6 +1314,7 @@ impl App {
                 set_memory_low(&inst.webview, false);
                 self.low_unfocused = false;
                 self.trim_at = None;
+                self.leave_background_mode();
             }
             self.record_geom();
         }
@@ -1562,6 +1589,16 @@ impl App {
         }
     }
 
+    /// Kembalikan prioritas normal (jendela dibuka): Outlook langsung responsif.
+    fn leave_background_mode(&mut self) {
+        if self.background_mode {
+            win::set_background_mode(false);
+            self.background_mode = false;
+            self.diag_note("mode efisiensi nonaktif");
+        }
+        self.next_trim_check = None;
+    }
+
     /// Hemat RAM berkala (dipanggil dari tick).
     fn manage_memory(&mut self, now: Instant) {
         if !self.settings.low_memory {
@@ -1586,22 +1623,46 @@ impl App {
             return;
         }
 
-        // Rapikan working set proses WebView2.
-        if let Some(t) = self.trim_at {
-            if now >= t {
-                if self.settings.diagnostics {
-                    self.diag_note("sebelum rapikan");
-                    self.take_sample();
+        // Mode efisiensi (EcoQoS, prioritas rendah) selama tersembunyi/diminimalkan. Diterapkan
+        // ulang tiap pemeriksaan supaya proses WebView2 baru (setelah segarkan) ikut.
+        let check_due = self.next_trim_check.is_none_or(|t| now >= t);
+        if self.settings.efficiency_mode && (!self.background_mode || check_due) {
+            let n = win::set_background_mode(true);
+            if !self.background_mode {
+                self.diag_note(&format!("mode efisiensi aktif ({n} proses)"));
+            }
+            self.background_mode = true;
+        }
+
+        // Rapikan RAM: sesaat setelah disembunyikan, lalu otomatis setiap kali RAM nyata
+        // melewati batas (dicek tiap 30 detik), dan paling lambat tiap 5 menit.
+        let first_due = self.trim_at.is_some_and(|t| now >= t);
+        if first_due || check_due {
+            self.next_trim_check = Some(now + TRIM_CHECK);
+            let ws_mb = win::process_tree_memory()
+                .map(|m| m.working / (1024 * 1024))
+                .unwrap_or(0);
+            let over = self.settings.trim_ws_mb > 0
+                && ws_mb > self.settings.trim_ws_mb as u64
+                && self.last_trim.is_none_or(|t| t.elapsed() >= TRIM_MIN_GAP);
+            if first_due || over {
+                if let Some(inst) = &self.inst {
+                    // Pindah ke Low lagi memicu WebView2 membersihkan memori (GC JavaScript,
+                    // cache), bukan hanya memindahkan halaman ke page file.
+                    set_memory_low(&inst.webview, false);
+                    set_memory_low(&inst.webview, true);
                 }
                 let n = win::trim_process_tree();
-                if self.settings.diagnostics {
-                    self.diag_note(&format!("sesudah rapikan ({n} proses)"));
-                    self.next_sample = Some(now + Duration::from_secs(5));
-                }
+                self.diag_note(&format!("rapikan: {ws_mb} MB ({n} proses)"));
+                self.last_trim = Some(now);
                 self.trim_at = Some(now + TRIM_EVERY);
-            } else {
-                self.next_tick = self.next_tick.min(t);
             }
+        }
+        if let Some(t) = self.trim_at {
+            self.next_tick = self.next_tick.min(t);
+        }
+        if let Some(t) = self.next_trim_check {
+            self.next_tick = self.next_tick.min(t);
         }
 
         // Outlook web membengkak bila berjalan berjam-jam: segarkan saat tersembunyi.
@@ -2587,6 +2648,9 @@ fn main() {
         last_refresh_check: None,
         settle_until: None,
         low_unfocused: false,
+        next_trim_check: None,
+        last_trim: None,
+        background_mode: false,
         update_running: false,
         last_update_check: None,
         update_ready: None,

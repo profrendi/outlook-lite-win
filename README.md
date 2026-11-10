@@ -99,9 +99,10 @@ Ikon tray: **titik merah** = ada email belum dibaca, **titik kuning** = perlu lo
 
 | Keadaan | Yang dilakukan |
 |---|---|
-| Selalu | Tanpa GPU, tanpa service worker Outlook, V8 hemat memori, tanpa proses renderer cadangan, tanpa cache halaman sebelumnya, iframe Microsoft berbagi proses dengan Outlook |
+| Selalu | Tanpa GPU, tanpa service worker Outlook, V8 hemat memori, mode perangkat RAM kecil Chromium, tanpa proses renderer cadangan, tanpa cache halaman sebelumnya, tanpa layanan jaringan latar, iframe Microsoft berbagi proses dengan Outlook, telemetri Outlook/Office diblokir, autofill & simpan kata sandi WebView2 mati |
 | Dipakai, tapi tidak difokus > 1 menit | WebView2 diminta memakai memori rendah; normal lagi saat jendela difokus |
-| Diminimalkan / di tray | Tampilan WebView2 dimatikan, memori rendah, lalu memori proses WebView2 dirapikan 20 detik kemudian dan tiap 5 menit |
+| Diminimalkan / di tray | Tampilan WebView2 dimatikan; **mode efisiensi** Windows (daun hijau di Task Manager), prioritas CPU dan memori rendah; RAM dicek tiap 30 detik dan dirapikan otomatis bila melewati 40 MB (paling sering tiap 60 detik, paling lambat tiap 5 menit), sekaligus memicu WebView2 membersihkan memori JavaScript; panel folder dibaca tiap 9 detik (email masuk tetap terdeteksi seketika) |
+| Dibuka lagi | Prioritas dan memori langsung kembali normal |
 | Di tray berjam-jam | Outlook disegarkan otomatis bila RAM nyata naik lagi di atas 350 MB setelah dirapikan, commit melebihi 700 MB, atau sudah berjalan 8 jam (hanya bila tersembunyi ≥ 10 menit dan tidak sedang menulis email) |
 | Di luar jam kerja | Outlook tersembunyi ditutup |
 
@@ -157,6 +158,10 @@ Di `%LOCALAPPDATA%\OutlookLite\settings.json`. Setelah diubah manual, pilih
   "unread_selector": null,
   "refresh_mb": 700,
   "refresh_ws_mb": 350,
+  "trim_ws_mb": 40,
+  "efficiency_mode": true,
+  "block_telemetry": true,
+  "low_end_mode": true,
   "refresh_hours": 8,
   "tray_mobile_ui": false,
   "site_isolation": false,
@@ -166,8 +171,10 @@ Di `%LOCALAPPDATA%\OutlookLite\settings.json`. Setelah diubah manual, pilih
 }
 ```
 
-`refresh_mb` / `refresh_ws_mb` / `refresh_hours` = 0 mematikan penyegaran otomatis. `site_isolation`, `no_gpu`,
-`v8_optimize_for_size`, dan `extra_browser_args` berlaku setelah aplikasi di-restart.
+`refresh_mb` / `refresh_ws_mb` / `refresh_hours` = 0 mematikan penyegaran otomatis. `trim_ws_mb` = 0
+hanya merapikan berkala. `low_end_mode` bisa membuat gulir terlihat sedikit kurang halus; set `false`
+bila mengganggu. `site_isolation`, `no_gpu`, `low_end_mode`, `v8_optimize_for_size`, dan
+`extra_browser_args` berlaku setelah aplikasi di-restart.
 
 ## Diagnostik halaman (jika jumlah belum dibaca tidak terbaca)
 

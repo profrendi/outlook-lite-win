@@ -417,6 +417,110 @@ mod imp {
         map
     }
 
+    /// Mode efisiensi untuk aplikasi + proses WebView2 saat Outlook tersembunyi/diminimalkan:
+    /// EcoQoS (daun hijau "Efficiency mode" di Task Manager), prioritas CPU di bawah normal,
+    /// dan prioritas memori rendah (Windows memindahkan halaman ini lebih dulu bila RAM perlu).
+    /// `false` mengembalikan ke normal. Mengembalikan jumlah proses yang berhasil diatur.
+    pub fn set_background_mode(background: bool) -> u32 {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{
+            OpenProcess, ProcessMemoryPriority, ProcessPowerThrottling, SetPriorityClass,
+            SetProcessInformation, BELOW_NORMAL_PRIORITY_CLASS, MEMORY_PRIORITY_INFORMATION,
+            MEMORY_PRIORITY_LOW, MEMORY_PRIORITY_NORMAL, NORMAL_PRIORITY_CLASS,
+            PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            PROCESS_POWER_THROTTLING_STATE, PROCESS_SET_INFORMATION,
+        };
+        let throttle = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            // Saat normal: ControlMask 0 = serahkan ke Windows (bawaan).
+            ControlMask: if background { PROCESS_POWER_THROTTLING_EXECUTION_SPEED } else { 0 },
+            StateMask: if background { PROCESS_POWER_THROTTLING_EXECUTION_SPEED } else { 0 },
+        };
+        let mem = MEMORY_PRIORITY_INFORMATION {
+            MemoryPriority: if background { MEMORY_PRIORITY_LOW } else { MEMORY_PRIORITY_NORMAL },
+        };
+        let class = if background { BELOW_NORMAL_PRIORITY_CLASS } else { NORMAL_PRIORITY_CLASS };
+        let mut n = 0;
+        for pid in tree_pids() {
+            unsafe {
+                let Ok(h) = OpenProcess(PROCESS_SET_INFORMATION, false, pid) else {
+                    continue;
+                };
+                let _ = SetPriorityClass(h, class);
+                let _ = SetProcessInformation(
+                    h,
+                    ProcessPowerThrottling,
+                    &throttle as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+                );
+                if SetProcessInformation(
+                    h,
+                    ProcessMemoryPriority,
+                    &mem as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
+                )
+                .is_ok()
+                {
+                    n += 1;
+                }
+                let _ = CloseHandle(h);
+            }
+        }
+        n
+    }
+
+    /// Pengaturan WebView2 yang tidak dibutuhkan Outlook dimatikan (autofill formulir,
+    /// simpan kata sandi), dan permintaan telemetri ke `blocked_hosts` dijawab langsung
+    /// "204 No Content" tanpa keluar ke internet.
+    pub fn tune_webview(webview: &wry::WebView, blocked_hosts: &'static [&'static str]) {
+        use webview2_com::{
+            take_pwstr,
+            Microsoft::Web::WebView2::Win32::{
+                ICoreWebView2Settings4, ICoreWebView2_2, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+            },
+            WebResourceRequestedEventHandler,
+        };
+        use windows::core::{w, Interface, HSTRING, PWSTR};
+        use wry::WebViewExtWindows;
+        let wv = webview.webview();
+        unsafe {
+            if let Ok(st) = wv.Settings().and_then(|s| s.cast::<ICoreWebView2Settings4>()) {
+                let _ = st.SetIsGeneralAutofillEnabled(false);
+                let _ = st.SetIsPasswordAutosaveEnabled(false);
+            }
+            if blocked_hosts.is_empty() {
+                return;
+            }
+            for host in blocked_hosts {
+                let filter = HSTRING::from(format!("https://{host}/*"));
+                let _ = wv.AddWebResourceRequestedFilter(&filter, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+            }
+            let handler = WebResourceRequestedEventHandler::create(Box::new(move |sender, args| {
+                let (Some(sender), Some(args)) = (sender, args) else {
+                    return Ok(());
+                };
+                let mut uri = PWSTR::null();
+                args.Request()?.Uri(&mut uri)?;
+                let uri = take_pwstr(uri);
+                let host = crate::urlutil::host_of(&uri).unwrap_or_default();
+                if !crate::urlutil::host_matches_pattern(&host, blocked_hosts) {
+                    return Ok(());
+                }
+                let env = sender.cast::<ICoreWebView2_2>()?.Environment()?;
+                let resp = env.CreateWebResourceResponse(
+                    None::<&windows::Win32::System::Com::IStream>,
+                    204,
+                    w!("No Content"),
+                    w!(""),
+                )?;
+                args.SetResponse(&resp)?;
+                Ok(())
+            }));
+            let mut token = 0i64;
+            let _ = wv.add_WebResourceRequested(&handler, &mut token);
+        }
+    }
+
     /// Panggil `cb` dengan jenis kegagalan bila proses WebView2 mati/macet
     /// (0 = browser, 1 = renderer halaman keluar, 2 = renderer tidak merespons, 6 = GPU, ...).
     pub fn on_process_failed(webview: &wry::WebView, cb: impl Fn(i32) + 'static) {
@@ -577,6 +681,10 @@ mod imp {
         String::new()
     }
     pub fn on_process_failed(_webview: &wry::WebView, _cb: impl Fn(i32) + 'static) {}
+    pub fn set_background_mode(_background: bool) -> u32 {
+        0
+    }
+    pub fn tune_webview(_webview: &wry::WebView, _blocked_hosts: &'static [&'static str]) {}
     pub fn trim_process_tree() -> u32 {
         0
     }

@@ -53,6 +53,14 @@ pub struct Settings {
     pub low_memory: bool,
     /// Segarkan Outlook tersembunyi bila memori WebView2 (commit) melebihi ini, dalam MB. 0 = tidak.
     pub refresh_mb: u32,
+    /// Saat tersembunyi/diminimalkan, rapikan RAM otomatis bila melewati ini (MB). 0 = hanya berkala.
+    pub trim_ws_mb: u32,
+    /// Mode efisiensi Windows (EcoQoS) + prioritas rendah untuk WebView2 saat tersembunyi.
+    pub efficiency_mode: bool,
+    /// Blokir telemetri Outlook/Office di dalam WebView2.
+    pub block_telemetry: bool,
+    /// Mode perangkat RAM kecil Chromium (berlaku setelah restart).
+    pub low_end_mode: bool,
     /// Segarkan Outlook tersembunyi bila RAM nyata (working set) naik lagi melebihi ini, MB. 0 = tidak.
     pub refresh_ws_mb: u32,
     /// Eksperimen: Outlook tersembunyi di tray memakai tampilan mobile (mungkin lebih ringan).
@@ -101,6 +109,10 @@ impl Default for Settings {
             low_memory: true,
             refresh_mb: 700,
             refresh_ws_mb: 350,
+            trim_ws_mb: 40,
+            efficiency_mode: true,
+            block_telemetry: true,
+            low_end_mode: true,
             tray_mobile_ui: false,
             refresh_hours: 8,
             zoom: 1.0,
@@ -172,6 +184,9 @@ impl Settings {
             self.refresh_mb = self.refresh_mb.clamp(300, 8000);
         }
         self.refresh_hours = self.refresh_hours.min(72);
+        if self.trim_ws_mb != 0 {
+            self.trim_ws_mb = self.trim_ws_mb.clamp(15, 2000);
+        }
         if self.refresh_ws_mb != 0 {
             self.refresh_ws_mb = self.refresh_ws_mb.clamp(150, 8000);
         }
