@@ -33,6 +33,21 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      - name: Cek DLL yang dibutuhkan exe
+        shell: pwsh
+        run: |
+          python -m pip install --quiet pefile
+          @'
+          import pefile, sys
+          pe = pefile.PE("target/release/outlook-lite.exe")
+          dlls = sorted({e.dll.decode().lower() for e in pe.DIRECTORY_ENTRY_IMPORT})
+          print("Import DLL:", ", ".join(dlls))
+          bad = [d for d in dlls if d.startswith(("vcruntime", "msvcp", "api-ms-win-crt", "ucrtbase", "webview2loader"))]
+          if bad:
+              sys.exit("DLL non-bawaan Windows dibutuhkan: " + ", ".join(bad))
+          '@ | Set-Content check_imports.py
+          python check_imports.py
+
       - name: Package
         shell: pwsh
         run: |

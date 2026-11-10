@@ -1,0 +1,4 @@
+# Sertakan runtime Visual C++ di dalam exe, supaya jalan di PC tanpa
+# VC++ Redistributable (memasangnya butuh hak admin).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
