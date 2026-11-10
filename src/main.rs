@@ -14,6 +14,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 mod icon;
+mod install;
 mod settings;
 mod update;
 mod urlutil;
@@ -43,7 +44,9 @@ use wry::{NewWindowResponse, PageLoadEvent, WebContext, WebView, WebViewBuilder}
 
 use icon::Badge;
 use settings::{Mode, Settings, WindowGeom, HEMAT_INTERVALS};
-use urlutil::{is_microsoft_url, is_outlook_url, CALENDAR_URL, COMPOSE_URL, MAIL_URL};
+use urlutil::{
+    is_microsoft_url, is_outlook_mail_url, is_outlook_url, CALENDAR_URL, COMPOSE_URL, MAIL_URL,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const INSTANCE_PORT: u16 = 47193;
@@ -90,6 +93,8 @@ enum UserEvent {
 enum RemoteCmd {
     Show,
     Open(String),
+    /// Diminta keluar oleh installer/uninstaller.
+    Exit,
 }
 
 enum PageMsg {
@@ -138,6 +143,8 @@ struct Args {
     tray: bool,
     compose: bool,
     restarted: bool,
+    portable: bool,
+    uninstall: bool,
     mailto: Option<String>,
 }
 
@@ -147,6 +154,8 @@ fn parse_args() -> Args {
         tray: false,
         compose: false,
         restarted: false,
+        portable: false,
+        uninstall: false,
         mailto: None,
     };
     let mut i = 0;
@@ -155,6 +164,8 @@ fn parse_args() -> Args {
             "--tray" => a.tray = true,
             "--compose" => a.compose = true,
             "--restarted" => a.restarted = true,
+            "--portable" => a.portable = true,
+            "--uninstall" => a.uninstall = true,
             "--mailto" => {
                 a.mailto = v.get(i + 1).cloned();
                 i += 1;
@@ -206,6 +217,58 @@ fn acquire_lock(cmd: Option<&str>, restarted: bool) -> Lock {
     Lock::None
 }
 
+/// Minta instance yang sedang berjalan untuk keluar, lalu tunggu sampai benar-benar keluar.
+/// Mengembalikan true bila memang ada instance yang berjalan.
+fn stop_running_instance() -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], INSTANCE_PORT));
+    let mut asked = false;
+    if let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_millis(800)) {
+        let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut line = String::new();
+        if BufReader::new(&s).read_line(&mut line).is_ok() && line.trim() == MAGIC {
+            let _ = s.write_all(b"exit\n");
+            asked = true;
+        }
+    }
+    if asked {
+        for _ in 0..50 {
+            if TcpListener::bind(addr).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        // beri waktu proses WebView2 ikut berhenti
+        std::thread::sleep(Duration::from_millis(800));
+    }
+    asked
+}
+
+fn run_uninstall(dir: &Path) {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let installed = install::is_installed_copy(&exe);
+    if !win::confirm(
+        "Hapus Outlook Lite dari komputer ini?\n\nPengaturan dan data login Outlook Lite juga akan dihapus. Akun Outlook Anda sendiri tidak terpengaruh.",
+    ) {
+        return;
+    }
+    stop_running_instance();
+    let _ = win::set_autostart(false, &exe);
+    win::unregister_mailto();
+    install::remove_integration();
+    let install_dir = install::install_dir();
+    if installed {
+        win::delete_dirs_later(&[dir, &install_dir]);
+    } else {
+        // Salinan portable: jangan hapus folder tempat exe berada.
+        win::delete_dirs_later(&[dir]);
+    }
+    win::info(if installed {
+        "Outlook Lite sudah dihapus."
+    } else {
+        "Pengaturan dan data Outlook Lite sudah dihapus. File exe portable bisa Anda hapus sendiri."
+    });
+}
+
 fn serve_lock(listener: TcpListener, proxy: EventLoopProxy<UserEvent>) {
     std::thread::spawn(move || {
         for conn in listener.incoming() {
@@ -219,6 +282,8 @@ fn serve_lock(listener: TcpListener, proxy: EventLoopProxy<UserEvent>) {
             let line = line.trim();
             let cmd = if line == "show" {
                 Some(RemoteCmd::Show)
+            } else if line == "exit" {
+                Some(RemoteCmd::Exit)
             } else if let Some(url) = line.strip_prefix("open ") {
                 // Hanya URL compose Outlook yang diterima dari proses lain.
                 url.starts_with(COMPOSE_URL)
@@ -314,6 +379,8 @@ mod id {
     pub const DIAG_RAM: &str = "diag_ram";
     pub const INSPECT: &str = "inspect";
     pub const OPEN_FOLDER: &str = "open_folder";
+    pub const OPEN_APP_FOLDER: &str = "open_app_folder";
+    pub const UNINSTALL: &str = "uninstall";
     pub const RELOAD: &str = "reload";
     pub const RESTART_UPDATE: &str = "restart_update";
     pub const CLOSE_WINDOW: &str = "close_window";
@@ -372,14 +439,7 @@ fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> 
     );
     let low_mem = check(id::LOW_MEM, "Hemat memori WebView2", false);
     let autostart = check(id::AUTOSTART, "Mulai dengan Windows", false);
-    let hotkeys = check(
-        id::HOTKEYS,
-        &format!(
-            "Hotkey ({} buka/tutup, {} email baru)",
-            s.hotkey_toggle, s.hotkey_compose
-        ),
-        false,
-    );
+    let hotkeys = check(id::HOTKEYS, &hotkey_label(s), false);
     let mailto = check(id::MAILTO, "Aplikasi email default (mailto)", false);
     let auto_update = check(id::AUTO_UPDATE, "Update otomatis", false);
     let diag = check(id::DIAG_RAM, "Diagnostik RAM", false);
@@ -431,7 +491,9 @@ fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> 
             &sep(),
             &item(id::INSPECT, "Diagnostik halaman Outlook"),
             &item(id::OPEN_FOLDER, "Buka folder pengaturan"),
+            &item(id::OPEN_APP_FOLDER, "Buka folder aplikasi"),
             &item(id::RELOAD, "Muat ulang pengaturan"),
+            &item(id::UNINSTALL, "Hapus instalasi…"),
             &MenuItem::new(format!("Outlook Lite v{VERSION}"), false, None),
         ],
     )?;
@@ -486,6 +548,17 @@ fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> 
             restart_update,
         },
     ))
+}
+
+/// Kombinasi cadangan bila hotkey bawaan sudah dipakai aplikasi lain.
+const TOGGLE_ALTS: [&str; 3] = ["Ctrl+Alt+O", "Ctrl+Shift+Alt+O", "Ctrl+Alt+K"];
+const COMPOSE_ALTS: [&str; 3] = ["Ctrl+Alt+N", "Ctrl+Alt+M", "Ctrl+Shift+Alt+N"];
+
+fn hotkey_label(s: &Settings) -> String {
+    format!(
+        "Hotkey ({} buka/tutup, {} email baru)",
+        s.hotkey_toggle, s.hotkey_compose
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -755,27 +828,78 @@ impl App {
         }
         let Some(m) = &self.hk_manager else { return };
         let mut errors = Vec::new();
-        for (text, is_toggle) in [
-            (self.settings.hotkey_toggle.clone(), true),
-            (self.settings.hotkey_compose.clone(), false),
-        ] {
-            if text.trim().is_empty() {
-                continue;
+        let mut replaced = Vec::new();
+        for is_toggle in [true, false] {
+            let configured = if is_toggle {
+                self.settings.hotkey_toggle.clone()
+            } else {
+                self.settings.hotkey_compose.clone()
+            };
+            if configured.trim().is_empty() {
+                continue; // dimatikan oleh pengguna
             }
-            match text.parse::<HotKey>() {
-                Ok(hk) => match m.register(hk) {
-                    Ok(()) => {
-                        if is_toggle {
-                            self.hk_toggle = Some(hk.id());
-                        } else {
-                            self.hk_compose = Some(hk.id());
+            // Coba kombinasi yang diatur dulu, lalu cadangan bila bentrok dengan aplikasi lain.
+            let alts: &[&str] = if is_toggle { &TOGGLE_ALTS } else { &COMPOSE_ALTS };
+            let mut candidates = vec![configured.clone()];
+            candidates.extend(
+                alts.iter()
+                    .map(|a| a.to_string())
+                    .filter(|a| !a.eq_ignore_ascii_case(&configured)),
+            );
+            let mut first_err = None;
+            let mut got = None;
+            for text in candidates {
+                match text.parse::<HotKey>() {
+                    Ok(hk) => match m.register(hk) {
+                        Ok(()) => {
+                            got = Some((text, hk));
+                            break;
                         }
-                        self.hk_registered.push(hk);
+                        Err(e) => {
+                            first_err.get_or_insert(format!("{text}: {e}"));
+                        }
+                    },
+                    Err(e) => {
+                        first_err.get_or_insert(format!("{text}: {e}"));
                     }
-                    Err(e) => errors.push(format!("{text}: {e}")),
-                },
-                Err(e) => errors.push(format!("{text}: {e}")),
+                }
             }
+            match got {
+                Some((text, hk)) => {
+                    if is_toggle {
+                        self.hk_toggle = Some(hk.id());
+                    } else {
+                        self.hk_compose = Some(hk.id());
+                    }
+                    self.hk_registered.push(hk);
+                    if text != configured {
+                        replaced.push(format!("{configured} → {text}"));
+                        if is_toggle {
+                            self.settings.hotkey_toggle = text;
+                        } else {
+                            self.settings.hotkey_compose = text;
+                        }
+                    }
+                }
+                None => errors.push(first_err.unwrap_or_else(|| configured.clone())),
+            }
+        }
+
+        if !replaced.is_empty() {
+            let msg = replaced.join(", ");
+            self.log(&format!("hotkey bentrok, diganti: {msg}"));
+            self.settings.hotkey_warned.clear();
+            // Simpan segera supaya pemberitahuan ini tidak muncul lagi di start berikutnya.
+            self.save();
+            if let Some(menu) = &self.menu {
+                menu.hotkeys.set_text(hotkey_label(&self.settings));
+            }
+            self.toast(
+                "Hotkey diganti otomatis",
+                &format!("Kombinasi lama sudah dipakai aplikasi lain. Sekarang: {msg}."),
+                None,
+                Some(false),
+            );
         }
         if errors.is_empty() {
             if !self.settings.hotkey_warned.is_empty() {
@@ -788,11 +912,11 @@ impl App {
             // Beri tahu sekali saja untuk kombinasi yang sama, bukan di setiap start.
             if self.settings.hotkey_warned != msg {
                 self.settings.hotkey_warned = msg.clone();
-                self.dirty = true;
+                self.save();
                 self.toast(
-                    "Hotkey sudah dipakai aplikasi lain",
+                    "Hotkey tidak bisa dipasang",
                     &format!(
-                        "{msg}. Fitur lain tetap jalan. Ganti lewat Pengaturan > Buka folder pengaturan > settings.json (hotkey_toggle / hotkey_compose), lalu Muat ulang pengaturan."
+                        "{msg}. Fitur lain tetap jalan. Ganti lewat Pengaturan > Buka folder pengaturan > settings.json, lalu Muat ulang pengaturan."
                     ),
                     None,
                     Some(false),
@@ -988,8 +1112,9 @@ impl App {
                 inst.visible = false;
                 // Sama seperti minimize: WebView2 berhemat, halaman tetap memantau.
                 let _ = inst.webview.set_visible(false);
-                // Pemantauan hanya jalan di halaman Outlook (bukan pintasan seperti To Do).
-                if !inst.webview.url().is_ok_and(|u| is_outlook_url(&u)) {
+                // Jumlah belum dibaca hanya terbaca di halaman Email
+                // (bukan Kalender/Kontak atau pintasan seperti To Do).
+                if !inst.webview.url().is_ok_and(|u| is_outlook_mail_url(&u)) {
                     let _ = inst.webview.load_url(MAIL_URL);
                 }
                 if self.settings.low_memory {
@@ -1080,13 +1205,46 @@ impl App {
             // Outlook sudah hidup: bangunkan bila tidur, lalu minta pemantau melapor.
             self.wake_page();
             if manual {
-                if let Some(inst) = &self.inst {
-                    let _ = inst
-                        .webview
-                        .evaluate_script("window.__oliteForce && window.__oliteForce()");
+                let (visible, on_mail) = self
+                    .inst
+                    .as_ref()
+                    .map(|i| {
+                        let mail = i.webview.url().is_ok_and(|u| is_outlook_mail_url(&u));
+                        (i.visible, mail)
+                    })
+                    .unwrap_or((false, true));
+                if !on_mail && visible {
+                    // Pengguna sedang di Kalender/Kontak: jangan pindahkan halamannya.
+                    self.manual_check = false;
+                    match self.shown_unread().filter(|n| *n >= 0) {
+                        Some(n) => self.report_manual(n),
+                        None => self.toast(
+                            "Outlook Lite",
+                            "Buka halaman Email dulu untuk mengecek jumlah belum dibaca.",
+                            None,
+                            Some(false),
+                        ),
+                    }
+                    return;
                 }
-                self.bg_deadline
-                    .get_or_insert(Instant::now() + Duration::from_secs(20));
+                if let Some(inst) = &self.inst {
+                    if on_mail {
+                        let _ = inst
+                            .webview
+                            .evaluate_script("window.__oliteForce && window.__oliteForce()");
+                    } else {
+                        // Tersembunyi di Kalender/Kontak: kembali ke Email lalu hitung.
+                        let _ = inst.webview.load_url(MAIL_URL);
+                    }
+                }
+                self.bg_deadline.get_or_insert(
+                    Instant::now()
+                        + if on_mail {
+                            Duration::from_secs(20)
+                        } else {
+                            BG_CHECK_TIMEOUT
+                        },
+                );
             }
             return;
         }
@@ -1636,6 +1794,17 @@ impl App {
                 }
                 win::open_folder(&self.dir)
             }
+            id::OPEN_APP_FOLDER => {
+                changed = false;
+                win::reveal_file(&self.exe);
+            }
+            id::UNINSTALL => {
+                changed = false;
+                // Proses terpisah menampilkan konfirmasi, lalu meminta instance ini keluar.
+                if let Err(e) = std::process::Command::new(&self.exe).arg("--uninstall").spawn() {
+                    self.log(&format!("uninstall gagal: {e}"));
+                }
+            }
             id::RELOAD => {
                 self.settings = Settings::load(&self.dir);
                 #[cfg(windows)]
@@ -1748,6 +1917,7 @@ impl App {
                 }
                 UserEvent::Remote(RemoteCmd::Show) => self.show(target, None),
                 UserEvent::Remote(RemoteCmd::Open(url)) => self.show(target, Some(&url)),
+                UserEvent::Remote(RemoteCmd::Exit) => self.quit(),
                 UserEvent::Page(PageMsg::State { unread, composing }) => {
                     self.on_state(unread, composing)
                 }
@@ -1788,7 +1958,37 @@ fn main() {
     let args = parse_args();
     let dir = data_dir();
     let _ = std::fs::create_dir_all(&dir);
+
+    if args.uninstall {
+        run_uninstall(&dir);
+        return;
+    }
     update::cleanup_old();
+
+    // Instal otomatis ke %LOCALAPPDATA%\Programs\OutlookLite (tanpa admin), lalu jalankan dari sana.
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(install::EXE_NAME));
+    if install::should_install(&exe, args.portable) {
+        let mut stopped = false;
+        match install::install_self(&exe, || stopped = stop_running_instance()) {
+            Ok(target) => {
+                let mut cmd = std::process::Command::new(&target);
+                cmd.args(std::env::args_os().skip(1).filter(|a| a != "--restarted"));
+                if stopped || args.restarted {
+                    cmd.arg("--restarted");
+                }
+                match cmd.spawn() {
+                    Ok(_) => {
+                        log(&dir, &format!("dijalankan dari {}", target.display()));
+                        return;
+                    }
+                    Err(e) => log(&dir, &format!("jalankan salinan terpasang gagal: {e}")),
+                }
+            }
+            Err(e) => log(&dir, &format!("instal otomatis gagal, jalan portable: {e}")),
+        }
+    } else if install::is_installed_copy(&exe) {
+        install::ensure_integration(&exe);
+    }
 
     let initial_url: Option<String> = if let Some(m) = &args.mailto {
         urlutil::mailto_to_compose(m)
@@ -1817,7 +2017,6 @@ fn main() {
     };
 
     let settings = Settings::load(&dir);
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("outlook-lite.exe"));
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -1943,6 +2142,8 @@ mod tests {
             tray: false,
             compose: false,
             restarted: false,
+            portable: false,
+            uninstall: false,
             mailto: Some("mailto:x@y.z".into()),
         };
         assert!(urlutil::mailto_to_compose(a.mailto.as_deref().unwrap()).is_some());

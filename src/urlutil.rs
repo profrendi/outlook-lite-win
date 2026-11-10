@@ -67,6 +67,17 @@ pub fn is_outlook_url(url: &str) -> bool {
     })
 }
 
+/// Halaman Email Outlook (bukan Kalender/Kontak): di sinilah folder Inbox bisa dihitung.
+pub fn is_outlook_mail_url(url: &str) -> bool {
+    if !is_outlook_url(url) {
+        return false;
+    }
+    let rest = &url["https://".len()..];
+    let path = rest.find('/').map(|i| &rest[i..]).unwrap_or("/");
+    let path = path.to_ascii_lowercase();
+    path.starts_with("/mail") || path.starts_with("/owa")
+}
+
 pub fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -175,6 +186,12 @@ mod tests {
         assert!(is_outlook_url("https://outlook.cloud.microsoft/mail/"));
         assert!(!is_outlook_url("https://outlook.cloud.microsoft.evil.com/"));
         assert!(is_microsoft_url("https://m365.cloud.microsoft/"));
+        assert!(is_outlook_mail_url("https://outlook.cloud.microsoft/mail/inbox"));
+        assert!(is_outlook_mail_url("https://outlook.office.com/owa/?realm=x"));
+        assert!(!is_outlook_mail_url("https://outlook.cloud.microsoft/calendar/view/week"));
+        assert!(!is_outlook_mail_url("https://outlook.cloud.microsoft/people/"));
+        assert!(!is_outlook_mail_url("https://outlook.cloud.microsoft"));
+        assert!(!is_outlook_mail_url("https://to-do.office.com/tasks/"));
         assert!(!is_outlook_url("https://login.microsoftonline.com/"));
     }
 

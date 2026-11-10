@@ -4,13 +4,23 @@ Outlook web (outlook.office.com) di system tray Windows, ditulis dengan Rust.
 Portable, **tanpa hak admin**, memakai WebView2 bawaan Windows dan login web biasa
 (tidak butuh izin Microsoft Graph dari admin kantor).
 
-## Unduh dan jalankan
+## Unduh dan pasang
 
 1. Buka halaman **Releases** repo ini, unduh `outlook-lite.exe`.
-2. Taruh di folder pengguna, misalnya `%LOCALAPPDATA%\OutlookLite\app\`.
-3. Jalankan. Login sekali; login tersimpan.
+2. Jalankan dari mana saja (mis. folder Downloads). Pada start pertama aplikasi otomatis:
+   - menyalin dirinya ke `%LOCALAPPDATA%\Programs\OutlookLite\`,
+   - membuat shortcut **Outlook Lite** di Start Menu,
+   - mendaftar di **Settings > Apps > Installed apps** (bisa di-uninstall dari sana),
+   - lalu berjalan dari folder itu. Semua tanpa hak admin.
+3. Login sekali; login tersimpan. File di Downloads boleh dihapus.
 
 Butuh WebView2 Runtime (sudah ada di Windows 11 dan di PC yang memakai Edge).
+
+**Mode portable** (tanpa instalasi): letakkan file kosong bernama `portable` di sebelah exe,
+atau jalankan dengan argumen `--portable`.
+
+**Hapus instalasi**: tray > Pengaturan > *Hapus instalasi…*, atau dari Installed apps.
+Pengaturan dan data login Outlook Lite ikut dihapus.
 
 ## Mode notifikasi
 
@@ -53,7 +63,7 @@ Klik kiri ikon = buka jendela. Klik kanan:
 - **Jendela**: tutup otomatis saat tidak aktif, hemat memori WebView2, zoom
 - **Pengaturan**: mulai dengan Windows, hotkey, aplikasi email default (mailto),
   update otomatis, cek update, diagnostik RAM, diagnostik halaman Outlook,
-  buka folder pengaturan, muat ulang pengaturan
+  buka folder pengaturan, buka folder aplikasi, muat ulang pengaturan, hapus instalasi
 - Restart untuk memakai versi baru · Tutup jendela · Keluar
 
 Ikon tray: **titik merah** = ada email belum dibaca, **titik kuning** = perlu login ulang.
@@ -64,7 +74,8 @@ Ikon tray: **titik merah** = ada email belum dibaca, **titik kuning** = perlu lo
 - **Hemat memori WebView2**: target memori rendah saat tersembunyi/diminimalkan; di mode
   Mati/Hemat halaman juga ditangguhkan saat diminimalkan.
 - **Ingat ukuran, posisi, zoom** jendela.
-- **Hotkey**: `Ctrl+Alt+O` buka/tutup jendela, `Ctrl+Alt+N` email baru.
+- **Hotkey**: `Ctrl+Alt+O` buka/tutup jendela, `Ctrl+Alt+N` email baru. Bila sudah dipakai
+  aplikasi lain, otomatis diganti kombinasi cadangan (mis. `Ctrl+Alt+M`) dan diberitahukan sekali.
 - **Mailto**: centang *Aplikasi email default (mailto)*, lalu pilih Outlook Lite untuk
   MAILTO di jendela *Aplikasi default* yang terbuka. Tautan email akan membuka layar tulis
   Outlook web dengan penerima/subjek terisi.
@@ -113,7 +124,7 @@ Skrip yang sama ada di `tools/inspect-outlook.js` untuk ditempel di Console DevT
 
 ## File dan log
 
-Semua di `%LOCALAPPDATA%\OutlookLite\`: `settings.json`, `outlook-lite.log`,
+Aplikasi: `%LOCALAPPDATA%\Programs\OutlookLite\outlook-lite.exe`. Data: `%LOCALAPPDATA%\OutlookLite\`: `settings.json`, `outlook-lite.log`,
 `WebView2\` (data login), `diagnostik-halaman.json`.
 
 ## Batasan

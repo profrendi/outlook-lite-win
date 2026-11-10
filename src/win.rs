@@ -33,6 +33,37 @@ pub fn open_folder(path: &Path) {
         .spawn();
 }
 
+/// Buka Explorer dengan file ini terpilih.
+pub fn reveal_file(path: &Path) {
+    let mut cmd = std::process::Command::new("explorer");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.raw_arg(format!("/select,\"{}\"", path.display()));
+    }
+    #[cfg(not(windows))]
+    cmd.arg(path.parent().unwrap_or(path));
+    let _ = cmd.spawn();
+}
+
+/// Hapus folder-folder ini beberapa detik setelah proses ini keluar.
+pub fn delete_dirs_later(dirs: &[&Path]) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut script = String::from("/c ping 127.0.0.1 -n 4 >nul");
+        for d in dirs {
+            script.push_str(&format!(" & rmdir /s /q \"{}\"", d.display()));
+        }
+        let _ = std::process::Command::new("cmd")
+            .raw_arg(script)
+            .creation_flags(0x0800_0000)
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    let _ = dirs;
+}
+
 pub fn open_in_notepad(path: &Path) {
     let _ = std::process::Command::new(if cfg!(windows) { "notepad" } else { "xdg-open" })
         .arg(path)
@@ -61,6 +92,30 @@ fn spawn_hidden(program: &str, args: &[&str]) {
 mod imp {
     use super::*;
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+
+    fn message_box(text: &str, flags: windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE) -> i32 {
+        use windows::core::HSTRING;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_SETFOREGROUND, MB_TOPMOST};
+        unsafe {
+            MessageBoxW(
+                None,
+                &HSTRING::from(text),
+                &HSTRING::from("Outlook Lite"),
+                flags | MB_TOPMOST | MB_SETFOREGROUND,
+            )
+            .0
+        }
+    }
+
+    pub fn confirm(text: &str) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONQUESTION, MB_YESNO};
+        message_box(text, MB_YESNO | MB_ICONQUESTION) == IDYES.0
+    }
+
+    pub fn info(text: &str) {
+        use windows::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK};
+        message_box(text, MB_OK | MB_ICONINFORMATION);
+    }
 
     fn hkcu() -> RegKey {
         RegKey::predef(HKEY_CURRENT_USER)
@@ -293,6 +348,13 @@ mod imp {
 #[cfg(not(windows))]
 mod imp {
     use super::*;
+    pub fn confirm(text: &str) -> bool {
+        eprintln!("[konfirmasi] {text}");
+        false
+    }
+    pub fn info(text: &str) {
+        eprintln!("[info] {text}");
+    }
     pub fn init_identity(_icon_png: Option<&Path>) {}
     pub fn toast(spec: &ToastSpec, _icon: Option<&Path>) {
         eprintln!("[toast] {} — {}", spec.title, spec.body);
