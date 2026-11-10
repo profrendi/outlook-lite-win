@@ -45,7 +45,11 @@ Belum dibaca di Inbox: 15
 ```
 
 - Baris atas: jumlah email yang baru masuk (email beruntun digabung).
-- Baris bawah: total belum dibaca di Inbox, sudah termasuk email baru itu.
+- Baris bawah: total belum dibaca di Inbox, sudah termasuk email baru itu. Angka ini dibaca
+  dari folder **Kotak Masuk** di panel folder Outlook (sama dengan yang Anda lihat), dan dibaca
+  ulang saat email masuk serta saat *Cek email sekarang*. Badge Outlook (tanda merah PWA)
+  hanya menghitung email baru sejak terakhir dilihat, jadi hanya dipakai sebagai tanda email
+  masuk, atau sebagai cadangan bila panel folder tidak tampil (jendela terlalu sempit).
 - Bila jumlah belum dibaca tidak terbaca, toast hanya berisi *"Email baru"*.
 - Notifikasi Outlook tanpa kenaikan jumlah (biasanya pengingat rapat) tampil sebagai toast
   *"Outlook"* terpisah.
@@ -98,7 +102,7 @@ Ikon tray: **titik merah** = ada email belum dibaca, **titik kuning** = perlu lo
 | Selalu | Tanpa GPU, tanpa service worker Outlook, V8 hemat memori, tanpa proses renderer cadangan, tanpa cache halaman sebelumnya, iframe Microsoft berbagi proses dengan Outlook |
 | Dipakai, tapi tidak difokus > 1 menit | WebView2 diminta memakai memori rendah; normal lagi saat jendela difokus |
 | Diminimalkan / di tray | Tampilan WebView2 dimatikan, memori rendah, lalu memori proses WebView2 dirapikan 20 detik kemudian dan tiap 5 menit |
-| Di tray berjam-jam | Outlook disegarkan otomatis bila memorinya melebihi 700 MB atau sudah berjalan 8 jam (hanya bila tersembunyi ≥ 10 menit dan tidak sedang menulis email) |
+| Di tray berjam-jam | Outlook disegarkan otomatis bila RAM nyata naik lagi di atas 350 MB setelah dirapikan, commit melebihi 700 MB, atau sudah berjalan 8 jam (hanya bila tersembunyi ≥ 10 menit dan tidak sedang menulis email) |
 | Di luar jam kerja | Outlook tersembunyi ditutup |
 
 Merapikan memori melepas halaman yang jarang disentuh dari RAM fisik; Windows memuatnya
@@ -112,6 +116,11 @@ Di menu **Jendela** (bawaan aktif):
   Outlook untuk cache/offline. Outlook mungkin sedikit lebih lama terbuka pertama kali.
   Notifikasi tidak terpengaruh.
 
+**Eksperimen tampilan mobile di tray** (`tray_mobile_ui`, bawaan mati, lewat settings.json):
+Outlook tersembunyi dimuat dengan tampilan HP yang mungkin lebih ringan. Membuka jendela jadi
+beberapa detik lebih lama (dimuat ulang versi desktop), dan jumlah belum dibaca di tray memakai
+badge Outlook. Bandingkan hasilnya lewat laporan diagnostik.
+
 ## Laporan diagnostik (RAM & CPU)
 
 1. Tray > Pengaturan > centang **Catat diagnostik (RAM & CPU tiap 30 detik)**.
@@ -123,8 +132,10 @@ Isi laporan: versi aplikasi, Windows, WebView2, RAM PC, pengaturan, ringkasan RA
 keadaan (dipakai, tak-fokus, minimize, tray, jeda), 300 baris log terakhir, dan data mentah
 per 30 detik: RAM & CPU per jenis proses (aplikasi, WebView2 Manager, renderer Outlook,
 renderer lain, GPU, utility), jumlah belum dibaca, dan kejadian (pindah keadaan, rapikan
-memori sebelum/sesudah, segarkan, toast, perlu login). Tidak berisi pengirim, subjek, atau
-isi email. Data mentah juga ada di `diagnostik.csv`.
+memori sebelum/sesudah, segarkan, toast, perlu login, sumber angka belum dibaca, proses
+WebView2 yang mati/macet). Log juga mencatat setiap aplikasi mulai dan keluar beserta
+alasannya, sesi yang berhenti tidak normal, dan lokasi error bila aplikasi crash. Tidak berisi
+pengirim, subjek, atau isi email. Data mentah juga ada di `diagnostik.csv`.
 
 ## settings.json
 
@@ -145,7 +156,9 @@ Di `%LOCALAPPDATA%\OutlookLite\settings.json`. Setelah diubah manual, pilih
   ],
   "unread_selector": null,
   "refresh_mb": 700,
+  "refresh_ws_mb": 350,
   "refresh_hours": 8,
+  "tray_mobile_ui": false,
   "site_isolation": false,
   "no_gpu": true,
   "block_service_worker": true,
@@ -153,7 +166,7 @@ Di `%LOCALAPPDATA%\OutlookLite\settings.json`. Setelah diubah manual, pilih
 }
 ```
 
-`refresh_mb` / `refresh_hours` = 0 mematikan penyegaran otomatis. `site_isolation`, `no_gpu`,
+`refresh_mb` / `refresh_ws_mb` / `refresh_hours` = 0 mematikan penyegaran otomatis. `site_isolation`, `no_gpu`,
 `v8_optimize_for_size`, dan `extra_browser_args` berlaku setelah aplikasi di-restart.
 
 ## Diagnostik halaman (jika jumlah belum dibaca tidak terbaca)
@@ -181,7 +194,9 @@ Aplikasi: `%LOCALAPPDATA%\Programs\OutlookLite\outlook-lite.exe`. Data: `%LOCALA
 - Bila sesi login kedaluwarsa, notifikasi berhenti sampai Anda login lagi (ikon kuning + toast).
 - Toast yang sudah masuk Pusat Notifikasi mungkin tidak membuka jendela saat diklik.
 
-## Build sendiri
+## Build dan rilis
 
-GitHub Actions membangun setiap push. Rilis dibuat dengan tag yang sama dengan versi di
-`Cargo.toml`: di GitHub buka *Releases > Draft a new release*, buat tag `v0.1.0`, lalu *Publish*. Actions akan melampirkan `outlook-lite.exe` dan `latest.json` (dibutuhkan update otomatis). Lokal di Windows: `cargo build --release`.
+GitHub Actions membangun setiap push. Bila versi di `Cargo.toml` belum punya rilis, push ke
+`main` otomatis menerbitkan rilis `vX.Y.Z` berisi `outlook-lite.exe` dan `latest.json`, dan
+aplikasi yang terpasang menemukannya lewat update otomatis. Tidak perlu membuat rilis manual.
+Lokal di Windows: `cargo build --release`.

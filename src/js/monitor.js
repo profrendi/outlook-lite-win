@@ -160,7 +160,37 @@
   } catch (e) {}
 
   // ---------- Jumlah belum dibaca ----------
-  const INBOX = /^(inbox|kotak masuk|kotak surat masuk)\b/i;
+  // Sumber utama: angka di folder Kotak Masuk/Inbox pada panel folder (sama dengan yang
+  // Anda lihat di Outlook). Badge aplikasi Outlook BUKAN total belum dibaca (hanya email
+  // baru sejak terakhir dilihat), jadi hanya dipakai aplikasi sebagai sinyal email masuk.
+  const INBOX = /^(inbox|kotak masuk|kotak surat masuk)(?![a-z])/i;
+
+  const leaves = (el) => {
+    const out = [];
+    for (const x of el.querySelectorAll('span,div,i,b')) {
+      if (x.children.length === 0) {
+        const t = (x.textContent || '').trim();
+        if (t) out.push(t);
+      }
+    }
+    return out;
+  };
+
+  function readInbox(it) {
+    const label = (it.getAttribute('aria-label') || it.getAttribute('title') || '').trim();
+    const texts = leaves(it);
+    const name = texts.find((t) => !/^\d+$/.test(t)) || (it.textContent || '').trim();
+    if (!INBOX.test(name) && !INBOX.test(label)) return null;
+    // "Inbox, 5 unread", "Kotak Masuk 5 item belum dibaca", "Inbox unread 5"
+    let m = label.match(/(\d+)\s*(?:items?\s*|item\s*)?(?:unread|belum)/i)
+      || label.match(/(?:unread|belum dibaca)\D{0,12}(\d+)/i);
+    if (m) return { n: +m[1], how: 'label' };
+    const nums = texts.filter((t) => /^\d{1,6}$/.test(t));
+    if (nums.length) return { n: +nums[0], how: 'angka' };
+    m = label.replace(INBOX, '').match(/(\d{1,6})/);
+    if (m) return { n: +m[1], how: 'label-angka' };
+    return { n: 0, how: 'tanpa-angka' }; // Outlook tidak menampilkan angka bila 0
+  }
 
   function readUnread() {
     if (cfg.sel) {
@@ -168,56 +198,53 @@
         const el = document.querySelector(cfg.sel);
         if (el) {
           const m = (el.textContent || '').match(/\d+/);
-          return m ? +m[0] : 0;
+          return { n: m ? +m[0] : 0, how: 'selector' };
         }
       } catch (e) {}
     }
-    const items = document.querySelectorAll('[role="treeitem"]');
-    for (const it of items) {
-      const label = (it.getAttribute('aria-label') || it.getAttribute('title') || '').trim();
-      const text = (it.innerText || it.textContent || '').trim();
-      const first = (text.split('\n')[0] || '').trim();
-      if (!INBOX.test(first) && !INBOX.test(label)) continue;
-      const m = label.match(/(\d+)\s*(unread|belum)/i);
-      if (m) return +m[1];
-      for (const line of text.split('\n')) {
-        const s = line.trim();
-        if (/^\d{1,6}$/.test(s)) return +s;
-      }
-      return 0;
+    let best = null;
+    for (const it of document.querySelectorAll('[role="treeitem"]')) {
+      const r = readInbox(it);
+      if (!r) continue;
+      if (!best || (r.how === 'label' && best.how !== 'label') || r.n > best.n) best = r;
+      if (best.how === 'label') break;
     }
+    if (best) return best;
     const mt = (document.title || '').match(/\((\d+)\)/);
-    if (mt) return +mt[1];
-    return -1;
+    if (mt) return { n: +mt[1], how: 'judul' };
+    // Panel folder tidak tampil (mis. jendela sempit) atau halaman belum siap.
+    return { n: -1, how: 'tak-terbaca' };
   }
-  window.__oliteUnread = readUnread;
+  window.__oliteUnread = () => readUnread().n;
 
   let last = null;
   let lastSent = 0;
   let prevRaw = null;
   let stable = -1;
+  let how = '';
   const start = Date.now();
-  function tick() {
+  function tick(force) {
     let composing = false;
     try {
       // Angka dianggap pasti setelah sama dua kali berturut-turut (3 detik),
       // supaya angka sementara saat halaman baru dimuat tidak memicu notifikasi palsu.
-      const raw = readUnread();
-      if (raw === prevRaw) stable = raw;
-      prevRaw = raw;
+      // force = permintaan aplikasi (email masuk / Cek email sekarang): pakai angka saat ini.
+      const r = readUnread();
+      if (force || r.n === prevRaw) { stable = r.n; how = r.how; }
+      prevRaw = r.n;
       composing = !!document.querySelector('[contenteditable="true"][role="textbox"]');
     } catch (e) {}
     const unread = stable;
     const now = Date.now();
-    const key = unread + '|' + composing;
-    if (key !== last || now - lastSent > 60000 || now - start < 30000) {
+    const key = unread + '|' + composing + '|' + how;
+    if (force || key !== last || now - lastSent > 60000 || now - start < 30000) {
       last = key;
       lastSent = now;
-      post({ t: 'state', unread, composing });
+      post({ t: 'state', unread, composing, how, force: !!force });
     }
   }
-  // Dipanggil aplikasi untuk "Cek email sekarang": laporkan segera.
-  window.__oliteForce = () => { last = null; prevRaw = readUnread(); stable = prevRaw; tick(); };
-  setInterval(tick, 3000);
-  document.addEventListener('DOMContentLoaded', () => setTimeout(tick, 500));
+  // Dipanggil aplikasi saat email masuk dan "Cek email sekarang": baca ulang segera.
+  window.__oliteForce = () => tick(true);
+  setInterval(() => tick(false), 3000);
+  document.addEventListener('DOMContentLoaded', () => setTimeout(() => tick(false), 500));
 })();

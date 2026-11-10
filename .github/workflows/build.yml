@@ -69,6 +69,32 @@ jobs:
           name: outlook-lite-windows
           path: dist/*
 
+      # Versi baru di Cargo.toml yang di-push ke main langsung diterbitkan sebagai rilis
+      # (tag vX.Y.Z + exe + latest.json), jadi update otomatis aplikasi langsung menemukannya.
+      # Versi yang sudah punya rilis dilewati.
+      - name: Rilis otomatis
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ver = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $tag = "v$ver"
+          gh release view $tag --repo "${{ github.repository }}" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            "Rilis $tag sudah ada, dilewati."
+            exit 0
+          }
+          $notes = git log -1 --pretty=%B | Where-Object { $_ -notmatch '^(Co-Authored-By|Claude-Session):' }
+          ($notes -join "`n").Trim() | Set-Content -Encoding utf8NoBOM release-notes.md
+          gh release create $tag dist/outlook-lite.exe dist/latest.json `
+            --repo "${{ github.repository }}" `
+            --target "${{ github.sha }}" `
+            --title "Outlook Lite $tag" `
+            --notes-file release-notes.md
+          if ($LASTEXITCODE -ne 0) { throw "Gagal membuat rilis $tag" }
+          "Rilis $tag diterbitkan."
+
       - name: Release
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2

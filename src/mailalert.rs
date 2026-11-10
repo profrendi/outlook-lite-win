@@ -41,6 +41,8 @@ pub struct Batch {
     latest: Option<i64>,
     counted: bool,
     sound: bool,
+    /// Badge Outlook naik (jumlah email baru sejak terakhir dilihat, bukan total).
+    badge: bool,
     notice: Option<Notice>,
 }
 
@@ -53,6 +55,7 @@ impl Batch {
             latest,
             counted: false,
             sound: false,
+            badge: false,
             notice: None,
         }
     }
@@ -137,6 +140,18 @@ impl Tracker {
         b.last_event = now;
     }
 
+    /// Badge Outlook naik: ada email baru, total diambil dari Inbox.
+    pub fn on_badge_rise(&mut self, current: Option<i64>, now: Instant) {
+        if self.echo(now) {
+            return;
+        }
+        let b = self
+            .batch
+            .get_or_insert_with(|| Batch::new(now, current, current));
+        b.badge = true;
+        b.last_event = now;
+    }
+
     /// Notifikasi bawaan Outlook (email baru atau pengingat).
     pub fn on_notice(&mut self, notice: Notice, current: Option<i64>, now: Instant) {
         if self.echo(now) {
@@ -196,8 +211,8 @@ fn evaluate(b: &Batch) -> Option<Alert> {
             notice: Some(notice.clone()),
         });
     }
-    if b.sound {
-        // Suara email masuk tapi angka belum naik: minimal satu email baru.
+    if b.sound || b.badge {
+        // Suara/badge email masuk tapi angka Inbox belum naik: minimal satu email baru.
         return Some(match (b.baseline, b.latest) {
             (Some(base), latest) => Alert::Mail {
                 new: Some(1),
@@ -399,6 +414,16 @@ mod tests {
         tr.on_sound(Some(3), after(t, 3000));
         tr.on_notice(notice(), Some(3), after(t, 3500));
         assert!(tr.batch().is_none());
+    }
+
+    #[test]
+    fn badge_naik_lalu_inbox_menyusul() {
+        let t = t0();
+        let mut tr = Tracker::default();
+        tr.on_badge_rise(Some(20), t);
+        tr.on_count(Some(20), 22, after(t, 1200));
+        let a = tr.take_due(after(t, 3800)).unwrap();
+        assert_eq!(a, Alert::Mail { new: Some(2), total: Some(22), notice: None });
     }
 
     #[test]

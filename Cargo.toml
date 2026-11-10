@@ -1,6 +1,6 @@
 [package]
 name = "outlook-lite"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 description = "Shell Outlook web ringan untuk Windows: tray, notifikasi, tanpa hak admin"
 license = "MIT"

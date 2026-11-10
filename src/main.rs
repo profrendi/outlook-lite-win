@@ -50,6 +50,8 @@ use urlutil::{
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Ada selama aplikasi berjalan; tersisa saat start berikutnya = sesi lalu berhenti tidak normal.
+const SESSION_MARKER: &str = "sesi-berjalan.txt";
 const INSTANCE_PORT: u16 = 47193;
 const MAGIC: &str = "OUTLOOKLITE1";
 /// Fitur Chromium yang dimatikan. Tiga pertama bawaan wry (harus dipertahankan).
@@ -86,6 +88,8 @@ const CREATE_RETRY: Duration = Duration::from_secs(300);
 const UPDATE_EVERY: Duration = Duration::from_secs(24 * 3600);
 const UPDATE_FIRST_DELAY: Duration = Duration::from_secs(90);
 /// Sampel diagnostik (RAM & CPU per proses) tiap ini, bila diagnostik aktif.
+/// Baca ulang angka Inbox sekali lagi setelah email masuk.
+const FORCE_AGAIN: Duration = Duration::from_millis(2000);
 const DIAG_EVERY: Duration = Duration::from_secs(30);
 /// Sampel tambahan sesaat setelah keadaan jendela berubah.
 const DIAG_AFTER_CHANGE: Duration = Duration::from_secs(15);
@@ -106,6 +110,8 @@ enum UserEvent {
     PageLoaded(String),
     ToastClick(Option<u64>),
     Update(update::Outcome, bool),
+    /// Proses WebView2 mati/macet (jenis kegagalan WebView2).
+    ProcessFailed(i32),
 }
 
 enum RemoteCmd {
@@ -116,7 +122,14 @@ enum RemoteCmd {
 }
 
 enum PageMsg {
-    State { unread: i64, composing: bool },
+    State {
+        unread: i64,
+        composing: bool,
+        /// Cara angka dibaca (label, angka, tanpa-angka, tak-terbaca, ...), untuk diagnostik.
+        how: String,
+        /// Pembacaan yang diminta aplikasi (email masuk / Cek email sekarang).
+        force: bool,
+    },
     Notify { id: u64, title: String, body: String },
     Badge(i64),
     Sound,
@@ -139,6 +152,8 @@ fn parse_page_msg(body: &str) -> Option<PageMsg> {
         "state" => Some(PageMsg::State {
             unread: v.get("unread")?.as_i64()?,
             composing: v.get("composing").and_then(|c| c.as_bool()).unwrap_or(false),
+            how: s("how", 24),
+            force: v.get("force").and_then(|c| c.as_bool()).unwrap_or(false),
         }),
         "notify" => Some(PageMsg::Notify {
             id: v.get("id")?.as_u64()?,
@@ -318,6 +333,18 @@ fn serve_lock(listener: TcpListener, proxy: EventLoopProxy<UserEvent>) {
 
 // ---------------------------------------------------------------------------
 // Util
+
+/// User agent Edge Android untuk eksperimen tampilan mobile di tray.
+fn mobile_user_agent() -> String {
+    let major = wry::webview_version()
+        .ok()
+        .and_then(|v| v.split('.').next().map(str::to_string))
+        .unwrap_or_else(|| "140".into());
+    format!(
+        "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) \
+         Chrome/{major}.0.0.0 Mobile Safari/537.36 EdgA/{major}.0.0.0"
+    )
+}
 
 fn browser_args_for(s: &Settings) -> String {
     let mut features = DISABLED_FEATURES.to_string();
@@ -589,6 +616,8 @@ struct Instance {
     visible: bool,
     minimized: bool,
     suspended: bool,
+    /// Outlook tersembunyi dimuat dengan tampilan mobile (eksperimen `tray_mobile_ui`).
+    mobile: bool,
 }
 
 struct App {
@@ -637,6 +666,9 @@ struct App {
     hk_compose: Option<u32>,
 
     last_row: Option<diag::Row>,
+    unread_how: String,
+    force_again: Option<Instant>,
+    last_unread_note: String,
     sampler: diag::Sampler,
     next_sample: Option<Instant>,
     diag_notes: Vec<String>,
@@ -1007,6 +1039,7 @@ impl App {
         let args = self.browser_args.clone();
         let proxy_ipc = self.proxy.clone();
         let proxy_load = self.proxy.clone();
+        let mobile = !visible && self.settings.tray_mobile_ui;
 
         let builder = WebViewBuilder::new_with_web_context(&mut self.web_context)
             .with_url(url)
@@ -1040,6 +1073,11 @@ impl App {
             use wry::WebViewBuilderExtWindows;
             builder.with_additional_browser_args(args)
         };
+        let builder = if mobile {
+            builder.with_user_agent(mobile_user_agent())
+        } else {
+            builder
+        };
 
         let webview = match builder.build(&window) {
             Ok(v) => v,
@@ -1060,6 +1098,12 @@ impl App {
             }
         };
         let _ = webview.zoom(zoom);
+        {
+            let p = self.proxy.clone();
+            win::on_process_failed(&webview, move |k| {
+                let _ = p.send_event(UserEvent::ProcessFailed(k));
+            });
+        }
         if !visible {
             // Beri tahu WebView2 bahwa halaman tidak terlihat supaya ia berhemat
             // (halaman tetap berjalan, seperti tab di latar belakang).
@@ -1083,6 +1127,7 @@ impl App {
             visible,
             minimized: false,
             suspended: false,
+            mobile,
         });
         self.refresh_tray();
         true
@@ -1107,6 +1152,10 @@ impl App {
 
     fn show(&mut self, target: &EventLoopWindowTarget<UserEvent>, url: Option<&str>) {
         self.bg_deadline = None;
+        // Outlook tersembunyi bertampilan mobile tidak dipakai untuk jendela: buat versi desktop.
+        if self.inst.as_ref().is_some_and(|i| i.mobile) {
+            self.destroy_instance();
+        }
         if let Some(inst) = self.inst.as_mut() {
             if let Some(u) = url {
                 let _ = inst.webview.load_url(u);
@@ -1146,7 +1195,11 @@ impl App {
             return;
         }
         self.record_geom();
-        if self.active_mode() == Mode::Siaga {
+        if self.active_mode() == Mode::Siaga && self.settings.tray_mobile_ui {
+            // Eksperimen: ganti dengan Outlook tersembunyi bertampilan mobile (dibuat di tick).
+            self.destroy_instance();
+            self.next_tick = Instant::now();
+        } else if self.active_mode() == Mode::Siaga {
             if let Some(inst) = self.inst.as_mut() {
                 inst.window.set_visible(false);
                 inst.visible = false;
@@ -1300,6 +1353,36 @@ impl App {
         }
     }
 
+    fn on_process_failed(&mut self, kind: i32) {
+        let what = match kind {
+            0 => "proses inti WebView2 berhenti",
+            1 => "proses halaman Outlook berhenti",
+            2 => "halaman Outlook tidak merespons",
+            3 => "proses bingkai halaman berhenti",
+            4 => "proses utility WebView2 berhenti",
+            6 => "proses GPU WebView2 berhenti",
+            _ => "proses WebView2 lain berhenti",
+        };
+        self.log(&format!("WebView2: {what} (jenis {kind})"));
+        self.diag_note(&format!("WebView2 gagal: {what}"));
+        match kind {
+            // Proses inti mati: WebView tidak bisa dipakai lagi, buat ulang di tick berikutnya
+            // (Siaga membuat Outlook tersembunyi baru otomatis).
+            0 => {
+                self.destroy_instance();
+                self.refresh_tray();
+            }
+            // Halaman mati/macet: muat ulang Outlook.
+            1 | 2 => {
+                if let Some(inst) = &self.inst {
+                    let _ = inst.webview.load_url(MAIL_URL);
+                }
+                self.settle_until = Some(Instant::now() + REFRESH_SETTLE);
+            }
+            _ => {}
+        }
+    }
+
     /// Buat ulang WebView (mis. setelah pengaturan skrip halaman berubah).
     fn recreate_instance(&mut self, target: &EventLoopWindowTarget<UserEvent>) {
         let Some(visible) = self.inst.as_ref().map(|i| i.visible && !i.minimized) else {
@@ -1339,6 +1422,17 @@ impl App {
             .map(|i| win::webview_process_kinds(&i.webview))
             .unwrap_or_default();
         let procs = win::process_snapshot(&kinds);
+        // Catat sumber angka belum dibaca bila berubah (Inbox vs badge Outlook).
+        let src = format!(
+            "inbox={} ({}) badge={}",
+            self.unread.map_or("?".into(), |n| n.to_string()),
+            if self.unread_how.is_empty() { "-" } else { &self.unread_how },
+            self.badge_unread.map_or("?".into(), |n| n.to_string())
+        );
+        if src != self.last_unread_note {
+            self.diag_notes.push(src.clone());
+            self.last_unread_note = src;
+        }
         let note = std::mem::take(&mut self.diag_notes).join(" | ");
         let row = self.sampler.row(
             Instant::now(),
@@ -1529,15 +1623,24 @@ impl App {
         let s = &self.settings;
         let mem = win::process_tree_memory();
         let commit_mb = mem.map(|m| m.commit / (1024 * 1024)).unwrap_or(0);
-        let too_big = s.refresh_mb > 0 && commit_mb > s.refresh_mb as u64;
+        // RAM nyata (working set) yang naik lagi setelah dirapikan = Outlook aktif membengkak.
+        let ws_mb = mem.map(|m| m.working / (1024 * 1024)).unwrap_or(0);
+        let ws_big = s.refresh_ws_mb > 0 && ws_mb > s.refresh_ws_mb as u64;
+        let too_big = ws_big || (s.refresh_mb > 0 && commit_mb > s.refresh_mb as u64);
         let too_old = s.refresh_hours > 0
             && self
                 .page_fresh_at
                 .is_some_and(|t| t.elapsed() >= Duration::from_secs(s.refresh_hours as u64 * 3600));
         if too_big || too_old {
             let why = format!(
-                "segarkan Outlook ({}; commit {commit_mb} MB)",
-                if too_big { "memori besar" } else { "berjalan lama" }
+                "segarkan Outlook ({}; RAM {ws_mb} MB, commit {commit_mb} MB)",
+                if ws_big {
+                    "RAM naik lagi setelah dirapikan"
+                } else if too_big {
+                    "commit besar"
+                } else {
+                    "berjalan lama"
+                }
             );
             self.log(&why);
             self.diag_note(&why);
@@ -1560,9 +1663,26 @@ impl App {
         }
     }
 
-    /// Jumlah belum dibaca yang ditampilkan: angka badge Outlook bila ada, kalau tidak hasil baca halaman.
+    /// Total belum dibaca di Inbox: dibaca dari panel folder Outlook. Badge Outlook hanya
+    /// cadangan bila panel folder tidak terbaca, karena badge = email baru sejak terakhir
+    /// dilihat (bukan total), dan Outlook mengosongkannya saat jendela dibuka.
     fn shown_unread(&self) -> Option<i64> {
-        self.badge_unread.or(self.unread)
+        self.unread.or(self.badge_unread)
+    }
+
+    /// Minta halaman membaca ulang angka Inbox sekarang, lalu sekali lagi sebentar kemudian
+    /// (angka Outlook kadang baru berubah 1-2 detik setelah suara/notifikasi).
+    fn force_read(&mut self) {
+        if let Some(inst) = &self.inst {
+            let _ = inst
+                .webview
+                .evaluate_script("window.__oliteForce && window.__oliteForce()");
+        }
+        let again = Instant::now() + FORCE_AGAIN;
+        if self.force_again.is_none() {
+            self.force_again = Some(again);
+        }
+        self.next_tick = self.next_tick.min(again);
     }
 
     fn sound_recent(&self) -> bool {
@@ -1588,7 +1708,14 @@ impl App {
         let prev = self.badge_unread;
         self.badge_unread = Some(count);
         self.login_seen_at = None;
-        self.note_count(prev, count);
+        if self.unread.is_none() {
+            // Panel folder belum/tidak terbaca: badge satu-satunya angka.
+            self.note_count(prev, count);
+        } else if prev.is_some_and(|p| count > p) {
+            self.mail.on_badge_rise(self.shown_unread(), Instant::now());
+            self.schedule_mail_flush();
+            self.force_read();
+        }
         self.refresh_tray();
     }
 
@@ -1596,6 +1723,7 @@ impl App {
         self.last_sound = Some(Instant::now());
         self.mail.on_sound(self.shown_unread(), Instant::now());
         self.schedule_mail_flush();
+        self.force_read();
     }
 
     /// Tutup batch email masuk bila waktunya, lalu tampilkan satu toast:
@@ -1646,8 +1774,12 @@ impl App {
         }
     }
 
-    fn on_state(&mut self, unread: i64, composing: bool) {
+    fn on_state(&mut self, unread: i64, composing: bool, how: String, force: bool) {
         self.composing = composing;
+        if how != self.unread_how && !how.is_empty() {
+            self.diag_note(&format!("baca Inbox: {how}"));
+            self.unread_how = how;
+        }
         self.login_seen_at = None;
         if self.needs_login {
             self.needs_login = false;
@@ -1659,13 +1791,20 @@ impl App {
                 self.inspect_sent = true;
             }
         }
+        if unread < 0 && force && self.manual_check && self.unread.is_none() {
+            // Halaman termuat tapi panel folder tidak tampil.
+            self.manual_check = false;
+            self.toast(
+                "Jumlah belum dibaca tidak terbaca",
+                "Panel folder Outlook tidak tampil. Lebarkan jendela Outlook Lite atau tampilkan panel folder.",
+                None,
+                Some(false),
+            );
+        }
         if unread >= 0 {
             let prev = self.unread;
             self.unread = Some(unread);
-            // Bila Outlook memberi angka badge, itu yang dipakai untuk peringatan.
-            if self.badge_unread.is_none() {
-                self.note_count(prev, unread);
-            }
+            self.note_count(prev, unread);
             if self.manual_check {
                 self.manual_check = false;
                 self.report_manual(self.shown_unread().unwrap_or(unread));
@@ -1681,6 +1820,7 @@ impl App {
         let notice = mailalert::Notice { id, title, body };
         self.mail.on_notice(notice, self.shown_unread(), Instant::now());
         self.schedule_mail_flush();
+        self.force_read();
     }
 
     fn on_page_loaded(&mut self, url: String) {
@@ -1829,12 +1969,14 @@ impl App {
             cmd.arg("--tray");
         }
         match cmd.spawn() {
-            Ok(_) => self.quit(),
+            Ok(_) => self.quit("restart"),
             Err(e) => self.log(&format!("restart gagal: {e}")),
         }
     }
 
-    fn quit(&mut self) {
+    fn quit(&mut self, reason: &str) {
+        self.log(&format!("keluar: {reason}"));
+        let _ = std::fs::remove_file(self.dir.join(SESSION_MARKER));
         self.destroy_instance();
         self.save();
         self.tray = None;
@@ -1882,6 +2024,14 @@ impl App {
         }
 
         self.check_login_stuck();
+        if self.force_again.is_some_and(|t| now >= t) {
+            self.force_again = None;
+            if let Some(inst) = &self.inst {
+                let _ = inst
+                    .webview
+                    .evaluate_script("window.__oliteForce && window.__oliteForce()");
+            }
+        }
         self.flush_mail_alert();
         self.manage_memory(now);
 
@@ -2109,7 +2259,7 @@ impl App {
             }
             id::QUIT => {
                 changed = false;
-                self.quit()
+                self.quit("menu Keluar")
             }
             other => {
                 changed = false;
@@ -2198,10 +2348,16 @@ impl App {
                 }
                 UserEvent::Remote(RemoteCmd::Show) => self.show(target, None),
                 UserEvent::Remote(RemoteCmd::Open(url)) => self.show(target, Some(&url)),
-                UserEvent::Remote(RemoteCmd::Exit) => self.quit(),
-                UserEvent::Page(PageMsg::State { unread, composing }) => {
-                    self.on_state(unread, composing)
+                UserEvent::Remote(RemoteCmd::Exit) => {
+                    self.quit("diminta instance lain (instal/update/hapus instalasi)")
                 }
+                UserEvent::ProcessFailed(kind) => self.on_process_failed(kind),
+                UserEvent::Page(PageMsg::State {
+                    unread,
+                    composing,
+                    how,
+                    force,
+                }) => self.on_state(unread, composing, how, force),
                 UserEvent::Page(PageMsg::Notify { id, title, body }) => {
                     self.on_notify(id, title, body)
                 }
@@ -2239,6 +2395,13 @@ fn main() {
     let args = parse_args();
     let dir = data_dir();
     let _ = std::fs::create_dir_all(&dir);
+    {
+        // Catat lokasi error sebelum aplikasi berhenti (release memakai panic = abort).
+        let d = dir.clone();
+        std::panic::set_hook(Box::new(move |info| {
+            log(&d, &format!("ERROR (aplikasi berhenti): {info}"));
+        }));
+    }
 
     if args.uninstall {
         run_uninstall(&dir);
@@ -2298,6 +2461,33 @@ fn main() {
     };
 
     let settings = Settings::load(&dir);
+
+    // Catat start dan deteksi sesi sebelumnya yang berhenti tanpa "keluar" (crash, dimatikan
+    // paksa lewat Task Manager, atau Windows dimatikan/logoff saat aplikasi berjalan).
+    let marker = dir.join(SESSION_MARKER);
+    let abnormal = std::fs::read_to_string(&marker).ok();
+    if let Some(prev) = &abnormal {
+        log(
+            &dir,
+            &format!("sesi sebelumnya berhenti tidak normal ({})", prev.trim()),
+        );
+    }
+    log(
+        &dir,
+        &format!(
+            "mulai v{VERSION} (pid {}, argumen: {})",
+            std::process::id(),
+            std::env::args().skip(1).collect::<Vec<_>>().join(" ")
+        ),
+    );
+    let _ = std::fs::write(
+        &marker,
+        format!(
+            "v{VERSION}, pid {}, mulai {}",
+            std::process::id(),
+            Local::now().format("%Y-%m-%d %H:%M:%S")
+        ),
+    );
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
@@ -2382,6 +2572,9 @@ fn main() {
         hk_toggle: None,
         hk_compose: None,
         last_row: None,
+        unread_how: String::new(),
+        force_again: None,
+        last_unread_note: String::new(),
         sampler: diag::Sampler::new(
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         ),
@@ -2400,6 +2593,9 @@ fn main() {
         initial_url,
         exiting: false,
     };
+    if abnormal.is_some() {
+        app.diag_note("sesi sebelumnya berhenti tidak normal");
+    }
 
     event_loop.run(move |event, target, control_flow| app.handle(event, target, control_flow));
 }
@@ -2411,8 +2607,8 @@ mod tests {
     #[test]
     fn page_messages() {
         assert!(matches!(
-            parse_page_msg(r#"{"t":"state","unread":3,"composing":true}"#),
-            Some(PageMsg::State { unread: 3, composing: true })
+            parse_page_msg(r#"{"t":"state","unread":3,"composing":true,"how":"angka"}"#),
+            Some(PageMsg::State { unread: 3, composing: true, force: false, .. })
         ));
         match parse_page_msg(r#"{"t":"notify","id":7,"title":"A\u0007B","body":"x"}"#) {
             Some(PageMsg::Notify { id, title, .. }) => {

@@ -53,6 +53,11 @@ pub struct Settings {
     pub low_memory: bool,
     /// Segarkan Outlook tersembunyi bila memori WebView2 (commit) melebihi ini, dalam MB. 0 = tidak.
     pub refresh_mb: u32,
+    /// Segarkan Outlook tersembunyi bila RAM nyata (working set) naik lagi melebihi ini, MB. 0 = tidak.
+    pub refresh_ws_mb: u32,
+    /// Eksperimen: Outlook tersembunyi di tray memakai tampilan mobile (mungkin lebih ringan).
+    /// Jumlah belum dibaca lalu memakai badge Outlook. Membuka jendela jadi beberapa detik lebih lama.
+    pub tray_mobile_ui: bool,
     /// Segarkan Outlook tersembunyi paling lambat tiap N jam (Outlook web cenderung membengkak). 0 = tidak.
     pub refresh_hours: u32,
     pub zoom: f64,
@@ -95,6 +100,8 @@ impl Default for Settings {
             auto_close_min: 10,
             low_memory: true,
             refresh_mb: 700,
+            refresh_ws_mb: 350,
+            tray_mobile_ui: false,
             refresh_hours: 8,
             zoom: 1.0,
             window: None,
@@ -165,6 +172,9 @@ impl Settings {
             self.refresh_mb = self.refresh_mb.clamp(300, 8000);
         }
         self.refresh_hours = self.refresh_hours.min(72);
+        if self.refresh_ws_mb != 0 {
+            self.refresh_ws_mb = self.refresh_ws_mb.clamp(150, 8000);
+        }
         self.auto_close_min = self.auto_close_min.clamp(1, 240);
         if !(0.25..=4.0).contains(&self.zoom) || self.zoom.is_nan() {
             self.zoom = 1.0;

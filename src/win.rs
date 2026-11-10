@@ -11,7 +11,6 @@ const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 pub type Callback = Arc<dyn Fn() + Send + Sync>;
 
 /// Memori proses aplikasi + semua proses WebView2 turunannya.
-#[allow(dead_code)] // working/count untuk diagnostik di masa depan
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TreeMem {
     /// Private working set (kolom Memory di Task Manager), byte.
@@ -253,7 +252,8 @@ mod imp {
 
     // ---------- diagnostik RAM ----------
 
-    /// PID proses ini + semua turunannya (proses WebView2).
+    /// PID proses ini + semua proses WebView2 turunannya. Program lain yang dibuka aplikasi
+    /// (Notepad, Explorer, browser untuk tautan) tidak ikut dihitung.
     fn tree_pids() -> Vec<u32> {
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -273,7 +273,11 @@ mod imp {
             };
             if Process32FirstW(snap, &mut e).is_ok() {
                 loop {
-                    pairs.push((e.th32ProcessID, e.th32ParentProcessID));
+                    let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+                    let name = String::from_utf16_lossy(&e.szExeFile[..len]);
+                    if name.eq_ignore_ascii_case("msedgewebview2.exe") {
+                        pairs.push((e.th32ProcessID, e.th32ParentProcessID));
+                    }
                     if Process32NextW(snap, &mut e).is_err() {
                         break;
                     }
@@ -413,6 +417,30 @@ mod imp {
         map
     }
 
+    /// Panggil `cb` dengan jenis kegagalan bila proses WebView2 mati/macet
+    /// (0 = browser, 1 = renderer halaman keluar, 2 = renderer tidak merespons, 6 = GPU, ...).
+    pub fn on_process_failed(webview: &wry::WebView, cb: impl Fn(i32) + 'static) {
+        use webview2_com::{
+            Microsoft::Web::WebView2::Win32::COREWEBVIEW2_PROCESS_FAILED_KIND,
+            ProcessFailedEventHandler,
+        };
+        use wry::WebViewExtWindows;
+        let handler = ProcessFailedEventHandler::create(Box::new(move |_wv, args| {
+            let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND(-1);
+            if let Some(a) = args {
+                unsafe {
+                    let _ = a.ProcessFailedKind(&mut kind);
+                }
+            }
+            cb(kind.0);
+            Ok(())
+        }));
+        let mut token = 0i64;
+        unsafe {
+            let _ = webview.webview().add_ProcessFailed(&handler, &mut token);
+        }
+    }
+
     /// Ringkasan sistem untuk laporan diagnostik (tanpa data pribadi).
     pub fn system_info() -> String {
         use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -548,6 +576,7 @@ mod imp {
     pub fn system_info() -> String {
         String::new()
     }
+    pub fn on_process_failed(_webview: &wry::WebView, _cb: impl Fn(i32) + 'static) {}
     pub fn trim_process_tree() -> u32 {
         0
     }
