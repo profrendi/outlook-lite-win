@@ -56,6 +56,8 @@ pub struct Settings {
     pub sound: bool,
     /// Tampilkan pengirim/subjek di notifikasi (mati bawaan demi privasi).
     pub show_details: bool,
+    /// Kirim toast memakai identitas PowerShell (jika toast dengan identitas sendiri tidak muncul).
+    pub toast_compat: bool,
     /// Selector CSS manual untuk angka belum dibaca (hasil Diagnostik halaman).
     pub unread_selector: Option<String>,
 
@@ -91,6 +93,7 @@ impl Default for Settings {
             work_days: vec![1, 2, 3, 4, 5],
             sound: true,
             show_details: false,
+            toast_compat: false,
             unread_selector: None,
             auto_close: true,
             auto_close_min: 10,

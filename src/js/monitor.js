@@ -158,6 +158,8 @@
       post({ t: 'state', unread, composing });
     }
   }
+  // Dipanggil aplikasi untuk "Cek email sekarang": laporkan segera.
+  window.__oliteForce = () => { last = null; prevRaw = readUnread(); stable = prevRaw; tick(); };
   setInterval(tick, 3000);
   document.addEventListener('DOMContentLoaded', () => setTimeout(tick, 500));
 })();

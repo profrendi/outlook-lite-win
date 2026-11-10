@@ -63,6 +63,8 @@ const HOOK_SUPPRESS: Duration = Duration::from_secs(20);
 const UPDATE_EVERY: Duration = Duration::from_secs(24 * 3600);
 const UPDATE_FIRST_DELAY: Duration = Duration::from_secs(90);
 const DIAG_EVERY: Duration = Duration::from_secs(10);
+/// Halaman login yang bertahan lebih lama dari ini (bukan sekadar redirect SSO) = perlu login.
+const LOGIN_GRACE: Duration = Duration::from_secs(40);
 
 // ---------------------------------------------------------------------------
 // Event
@@ -278,6 +280,8 @@ mod id {
     pub const OPEN_CAL: &str = "open_cal";
     pub const COMPOSE: &str = "compose";
     pub const CHECK_NOW: &str = "check_now";
+    pub const TEST_TOAST: &str = "test_toast";
+    pub const TOAST_COMPAT: &str = "toast_compat";
     pub const MODE_MATI: &str = "mode_mati";
     pub const MODE_HEMAT: &str = "mode_hemat";
     pub const MODE_SIAGA: &str = "mode_siaga";
@@ -312,6 +316,7 @@ struct TrayMenu {
     work_hours: CheckMenuItem,
     sound: CheckMenuItem,
     details: CheckMenuItem,
+    toast_compat: CheckMenuItem,
     auto_close: CheckMenuItem,
     low_mem: CheckMenuItem,
     autostart: CheckMenuItem,
@@ -344,6 +349,11 @@ fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> 
     );
     let sound = check(id::SOUND, "Bunyi notifikasi", false);
     let details = check(id::DETAILS, "Tampilkan pengirim && subjek", false);
+    let toast_compat = check(
+        id::TOAST_COMPAT,
+        "Mode kompatibel (jika notifikasi tidak muncul)",
+        false,
+    );
     let auto_close = check(
         id::AUTO_CLOSE,
         &format!("Tutup otomatis saat tidak aktif ({} menit)", s.auto_close_min),
@@ -380,6 +390,9 @@ fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> 
             &work_hours,
             &sound,
             &details,
+            &sep(),
+            &item(id::TEST_TOAST, "Tes notifikasi"),
+            &toast_compat,
         ],
     )?;
     let window = Submenu::with_items(
@@ -451,6 +464,7 @@ fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> 
             work_hours,
             sound,
             details,
+            toast_compat,
             auto_close,
             low_mem,
             autostart,
@@ -497,6 +511,9 @@ struct App {
     last_hook: Option<Instant>,
     needs_login: bool,
     login_toasted: bool,
+    login_seen_at: Option<Instant>,
+    last_tip: String,
+    last_title: String,
 
     next_tick: Instant,
     started: Instant,
@@ -505,6 +522,7 @@ struct App {
     bg_deadline: Option<Instant>,
     manual_check: bool,
     inspect_pending: bool,
+    inspect_sent: bool,
     create_failed_at: Option<Instant>,
 
     hk_manager: Option<GlobalHotKeyManager>,
@@ -555,6 +573,7 @@ impl App {
                 title: title.to_string(),
                 body: body.to_string(),
                 sound: force_sound.unwrap_or(self.settings.sound),
+                compat: self.settings.toast_compat,
                 on_click: Some(cb),
             },
             self.icon_png.as_deref(),
@@ -595,24 +614,33 @@ impl App {
             Badge::None
         };
         let status = self.status_text();
+        let tip: String = format!("Outlook Lite — {status}").chars().take(120).collect();
         if let Some(t) = &self.tray {
             if badge != self.badge {
                 let _ = t.set_icon(tray_image(badge));
             }
-            let tip: String = format!("Outlook Lite — {status}").chars().take(120).collect();
-            let _ = t.set_tooltip(Some(tip));
+            if tip != self.last_tip {
+                let _ = t.set_tooltip(Some(&tip));
+                if let Some(m) = &self.menu {
+                    m.status.set_text(&status);
+                }
+            }
         }
         self.badge = badge;
-        if let Some(m) = &self.menu {
-            m.status.set_text(&status);
-        }
+        self.last_tip = tip;
         if let Some(i) = &self.inst {
             let n = self.unread.unwrap_or(0);
-            i.window.set_title(&if n > 0 {
+            let title = if n > 0 {
                 format!("Outlook Lite ({n})")
             } else {
                 "Outlook Lite".into()
-            });
+            };
+            if title != self.last_title {
+                i.window.set_title(&title);
+                self.last_title = title;
+            }
+        } else {
+            self.last_title.clear();
         }
     }
 
@@ -628,6 +656,7 @@ impl App {
         m.work_hours.set_checked(s.work_hours_only);
         m.sound.set_checked(s.sound);
         m.details.set_checked(s.show_details);
+        m.toast_compat.set_checked(s.toast_compat);
         m.auto_close.set_checked(s.auto_close);
         m.low_mem.set_checked(s.low_memory);
         m.autostart.set_checked(s.autostart);
@@ -667,6 +696,7 @@ impl App {
                 }
                 self.menu = Some(handles);
                 self.badge = Badge::None;
+                self.last_tip.clear();
             }
             Err(e) => self.log(&format!("menu gagal: {e}")),
         }
@@ -764,7 +794,8 @@ impl App {
             Some(g) => wb
                 .with_position(PhysicalPosition::new(g.x, g.y))
                 .with_inner_size(PhysicalSize::new(g.width, g.height))
-                .with_maximized(g.maximized),
+                // Maksimalkan hanya jendela yang terlihat; di Windows maximize ikut menampilkan.
+                .with_maximized(g.maximized && visible),
             None => wb.with_inner_size(LogicalSize::new(1280.0, 800.0)),
         };
         let window = match wb.build(target) {
@@ -877,6 +908,9 @@ impl App {
             if !inst.visible {
                 inst.window.set_visible(true);
                 inst.visible = true;
+                if self.settings.window.is_some_and(|g| g.maximized) {
+                    inst.window.set_maximized(true);
+                }
             }
             if inst.window.is_minimized() {
                 inst.window.set_minimized(false);
@@ -908,6 +942,10 @@ impl App {
             if let Some(inst) = self.inst.as_mut() {
                 inst.window.set_visible(false);
                 inst.visible = false;
+                // Pemantauan hanya jalan di halaman Outlook (bukan pintasan seperti To Do).
+                if !inst.webview.url().is_ok_and(|u| is_outlook_url(&u)) {
+                    let _ = inst.webview.load_url(MAIL_URL);
+                }
                 if self.settings.low_memory {
                     set_memory_low(&inst.webview, true);
                 }
@@ -992,13 +1030,14 @@ impl App {
         if manual {
             self.manual_check = true;
         }
-        if self.inst.is_some() {
-            // Outlook sudah hidup: angka belum dibaca sudah dipantau langsung.
+        if let Some(inst) = &self.inst {
+            // Outlook sudah hidup: minta pemantau melapor sekarang juga.
             if manual {
-                if let Some(n) = self.unread.filter(|n| *n >= 0) {
-                    self.manual_check = false;
-                    self.report_manual(n);
-                }
+                let _ = inst
+                    .webview
+                    .evaluate_script("window.__oliteForce && window.__oliteForce()");
+                self.bg_deadline
+                    .get_or_insert(Instant::now() + Duration::from_secs(20));
             }
             return;
         }
@@ -1028,13 +1067,15 @@ impl App {
 
     fn on_state(&mut self, unread: i64, composing: bool) {
         self.composing = composing;
+        self.login_seen_at = None;
         if self.needs_login {
             self.needs_login = false;
             self.login_toasted = false;
         }
-        if self.inspect_pending {
+        if self.inspect_pending && !self.inspect_sent {
             if let Some(inst) = &self.inst {
                 let _ = inst.webview.evaluate_script(INSPECT_JS);
+                self.inspect_sent = true;
             }
         }
         if unread >= 0 {
@@ -1089,12 +1130,25 @@ impl App {
 
     fn on_page_loaded(&mut self, url: String) {
         if is_outlook_url(&url) {
-            return; // status dibersihkan saat skrip pemantau melapor
+            self.login_seen_at = None; // status login dibersihkan saat pemantau melapor
+            return;
         }
-        // Halaman login (Microsoft atau SSO kantor).
-        self.needs_login = true;
+        // Di jendela terlihat, halaman lain bisa saja pintasan (To Do, intranet).
+        // Di instance tersembunyi kita hanya memuat Outlook, jadi halaman lain = login/redirect.
         let hidden = self.inst.as_ref().is_some_and(|i| !i.visible);
-        if hidden && !self.login_toasted {
+        if hidden && self.login_seen_at.is_none() {
+            self.login_seen_at = Some(Instant::now());
+        }
+    }
+
+    /// Dipanggil dari tick: halaman login bertahan > LOGIN_GRACE berarti sesi habis.
+    fn check_login_stuck(&mut self) {
+        let Some(t) = self.login_seen_at else { return };
+        if t.elapsed() < LOGIN_GRACE || self.needs_login {
+            return;
+        }
+        self.needs_login = true;
+        if !self.login_toasted {
             self.login_toasted = true;
             self.toast(
                 "Outlook Lite perlu login ulang",
@@ -1111,7 +1165,11 @@ impl App {
     }
 
     fn on_inspect(&mut self, data: String) {
+        if !self.inspect_pending {
+            return; // hasil ganda
+        }
         self.inspect_pending = false;
+        self.inspect_sent = false;
         let path = self.dir.join("diagnostik-halaman.json");
         match std::fs::write(&path, data) {
             Ok(()) => {
@@ -1131,9 +1189,15 @@ impl App {
     }
 
     fn start_inspect(&mut self, target: &EventLoopWindowTarget<UserEvent>) {
+        if self.inspect_pending {
+            return;
+        }
         self.inspect_pending = true;
+        self.inspect_sent = false;
         if let Some(inst) = &self.inst {
             let _ = inst.webview.evaluate_script(INSPECT_JS);
+            self.inspect_sent = true;
+            self.bg_deadline.get_or_insert(Instant::now() + INSPECT_TIMEOUT);
         } else if self.create_instance(target, MAIL_URL, false) {
             self.bg_deadline = Some(Instant::now() + INSPECT_TIMEOUT);
         } else {
@@ -1263,6 +1327,8 @@ impl App {
             Mode::Mati => {}
         }
 
+        self.check_login_stuck();
+
         // Batas waktu cek/diagnostik tersembunyi.
         if self.bg_deadline.is_some_and(|d| now >= d) {
             if self.manual_check {
@@ -1276,6 +1342,7 @@ impl App {
             }
             if self.inspect_pending {
                 self.inspect_pending = false;
+                self.inspect_sent = false;
                 self.toast(
                     "Diagnostik halaman gagal",
                     "Buka Outlook, pastikan sudah login, lalu coba lagi.",
@@ -1355,6 +1422,16 @@ impl App {
             id::WORK_HOURS => self.settings.work_hours_only = !self.settings.work_hours_only,
             id::SOUND => self.settings.sound = !self.settings.sound,
             id::DETAILS => self.settings.show_details = !self.settings.show_details,
+            id::TOAST_COMPAT => self.settings.toast_compat = !self.settings.toast_compat,
+            id::TEST_TOAST => {
+                changed = false;
+                self.toast(
+                    "Tes notifikasi Outlook Lite",
+                    "Jika Anda melihat ini, notifikasi berfungsi. Klik untuk membuka Outlook.",
+                    None,
+                    None,
+                );
+            }
             id::AUTO_CLOSE => self.settings.auto_close = !self.settings.auto_close,
             id::LOW_MEM => self.settings.low_memory = !self.settings.low_memory,
             id::ZOOM_IN | id::ZOOM_OUT | id::ZOOM_RESET => {
@@ -1663,6 +1740,9 @@ fn main() {
         last_hook: None,
         needs_login: false,
         login_toasted: false,
+        login_seen_at: None,
+        last_tip: String::new(),
+        last_title: String::new(),
         next_tick: Instant::now() + TICK,
         started: Instant::now(),
         last_mode: Mode::Mati,
@@ -1670,6 +1750,7 @@ fn main() {
         bg_deadline: None,
         manual_check: false,
         inspect_pending: false,
+        inspect_sent: false,
         create_failed_at: None,
         hk_manager: None,
         hk_registered: Vec::new(),

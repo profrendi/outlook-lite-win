@@ -31,17 +31,21 @@ Notifikasi berasal dari dua sumber:
   desktop aktif.
 - **Jumlah belum dibaca di Inbox**, sebagai cadangan dan untuk lencana merah di ikon tray.
 
+Gunakan **Tes notifikasi** setelah instal. Jika toast tidak muncul, centang
+*Mode kompatibel*: toast dikirim memakai identitas PowerShell (tampil sebagai
+"Windows PowerShell") yang selalu terdaftar di Windows.
+
 Demi privasi mailbox, toast bawaan hanya berisi *"Ada email baru atau pengingat rapat"*.
 Aktifkan *Tampilkan pengirim & subjek* bila ingin detail.
 
 ## Menu tray
 
-Klik kiri ikon = buka/tutup jendela. Klik kanan:
+Klik kiri ikon = buka jendela. Klik kanan:
 
 - **Status** (mode, jumlah belum dibaca, RAM bila diagnostik aktif)
 - Buka Email · Buka Kalender · Email baru · Pintasan · **Cek email sekarang**
 - **Notifikasi**: mode Mati/Hemat/Siaga, interval Hemat (5/10/15/30 menit), hanya jam kerja,
-  bunyi, tampilkan pengirim & subjek
+  bunyi, tampilkan pengirim & subjek, **Tes notifikasi**, mode kompatibel
 - **Jendela**: tutup otomatis saat tidak aktif, hemat memori WebView2, zoom
 - **Pengaturan**: mulai dengan Windows, hotkey, aplikasi email default (mailto),
   update otomatis, cek update, diagnostik RAM, diagnostik halaman Outlook,
@@ -56,7 +60,7 @@ Ikon tray: **titik merah** = ada email belum dibaca, **titik kuning** = perlu lo
 - **Hemat memori WebView2**: target memori rendah saat tersembunyi/diminimalkan; di mode
   Mati/Hemat halaman juga ditangguhkan saat diminimalkan.
 - **Ingat ukuran, posisi, zoom** jendela.
-- **Hotkey**: `Ctrl+Alt+O` buka/tutup, `Ctrl+Alt+N` email baru.
+- **Hotkey**: `Ctrl+Alt+O` buka/tutup jendela, `Ctrl+Alt+N` email baru.
 - **Mailto**: centang *Aplikasi email default (mailto)*, lalu pilih Outlook Lite untuk
   MAILTO di jendela *Aplikasi default* yang terbuka. Tautan email akan membuka layar tulis
   Outlook web dengan penerima/subjek terisi.

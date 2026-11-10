@@ -14,6 +14,8 @@ pub struct ToastSpec {
     pub title: String,
     pub body: String,
     pub sound: bool,
+    /// Pakai identitas PowerShell yang selalu terdaftar di Windows.
+    pub compat: bool,
     pub on_click: Option<Callback>,
 }
 
@@ -94,7 +96,9 @@ mod imp {
             }
             t
         };
-        if build(AUMID).show().is_err() {
+        if spec.compat {
+            let _ = build(Toast::POWERSHELL_APP_ID).show();
+        } else if build(AUMID).show().is_err() {
             // Cadangan: pakai identitas PowerShell yang selalu terdaftar.
             let _ = build(Toast::POWERSHELL_APP_ID).show();
         }
