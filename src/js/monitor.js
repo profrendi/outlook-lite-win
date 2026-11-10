@@ -15,6 +15,22 @@
     try { window.ipc.postMessage(JSON.stringify(o)); } catch (e) { /* belum siap */ }
   };
 
+  // ---------- Hemat RAM: tanpa service worker ----------
+  // Service worker Outlook berjalan di proses renderer sendiri (~30-45 MB) hanya untuk
+  // cache/offline. Notifikasi tidak memakainya (diteruskan lewat shim di bawah).
+  if (cfg.nosw && navigator.serviceWorker) {
+    try {
+      navigator.serviceWorker.getRegistrations()
+        .then((rs) => rs.forEach((r) => r.unregister()))
+        .catch(() => {});
+      const blocked = () => Promise.reject(
+        new DOMException('Service worker dimatikan oleh Outlook Lite', 'SecurityError'));
+      Object.defineProperty(ServiceWorkerContainer.prototype, 'register', {
+        value: blocked, configurable: true, writable: true,
+      });
+    } catch (e) { /* abaikan */ }
+  }
+
   // ---------- Notification shim ----------
   let seq = 0;
   const live = new Map();

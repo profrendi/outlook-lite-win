@@ -12,6 +12,7 @@
 
 #![cfg_attr(not(windows), allow(dead_code))]
 
+mod diag;
 mod icon;
 mod install;
 mod mailalert;
@@ -70,9 +71,9 @@ const INSPECT_JS: &str = include_str!("js/inspect.js");
 const TICK: Duration = Duration::from_secs(5);
 /// Rapikan memori sesaat setelah jendela disembunyikan/diminimalkan, lalu berkala.
 const TRIM_DELAY: Duration = Duration::from_secs(20);
-const TRIM_EVERY: Duration = Duration::from_secs(15 * 60);
+const TRIM_EVERY: Duration = Duration::from_secs(5 * 60);
 /// Jendela terbuka tapi tidak difokus selama ini: WebView2 diminta memakai memori rendah.
-const UNFOCUSED_LOW: Duration = Duration::from_secs(3 * 60);
+const UNFOCUSED_LOW: Duration = Duration::from_secs(60);
 /// Cek apakah Outlook tersembunyi perlu disegarkan (memori membengkak).
 const REFRESH_CHECK_EVERY: Duration = Duration::from_secs(5 * 60);
 /// Jangan segarkan bila jendela baru saja ditutup (pengguna mungkin membukanya lagi).
@@ -84,7 +85,10 @@ const INSPECT_TIMEOUT: Duration = Duration::from_secs(90);
 const CREATE_RETRY: Duration = Duration::from_secs(300);
 const UPDATE_EVERY: Duration = Duration::from_secs(24 * 3600);
 const UPDATE_FIRST_DELAY: Duration = Duration::from_secs(90);
-const DIAG_EVERY: Duration = Duration::from_secs(10);
+/// Sampel diagnostik (RAM & CPU per proses) tiap ini, bila diagnostik aktif.
+const DIAG_EVERY: Duration = Duration::from_secs(30);
+/// Sampel tambahan sesaat setelah keadaan jendela berubah.
+const DIAG_AFTER_CHANGE: Duration = Duration::from_secs(15);
 /// Halaman login yang bertahan lebih lama dari ini (bukan sekadar redirect SSO) = perlu login.
 const LOGIN_GRACE: Duration = Duration::from_secs(120);
 /// Peringatan "perlu login" paling sering sekali per jangka waktu ini.
@@ -323,6 +327,10 @@ fn browser_args_for(s: &Settings) -> String {
         features.push_str(NO_SITE_ISOLATION);
         extra.push_str(" --disable-site-isolation-trials");
     }
+    if s.v8_optimize_for_size {
+        // V8 mengutamakan ukuran memori dibanding kecepatan (Outlook tetap lancar).
+        extra.push_str(" --js-flags=--optimize-for-size");
+    }
     format!("--disable-features={features} {AUTOPLAY_ARGS} {BG_ARGS}{extra}")
 }
 
@@ -390,6 +398,8 @@ mod id {
     pub const AUTO_CLOSE: &str = "auto_close";
     pub const LOW_MEM: &str = "low_mem";
     pub const NO_GPU: &str = "no_gpu";
+    pub const NO_SW: &str = "no_sw";
+    pub const DIAG_REPORT: &str = "diag_report";
     pub const ZOOM_IN: &str = "zoom_in";
     pub const ZOOM_OUT: &str = "zoom_out";
     pub const ZOOM_RESET: &str = "zoom_reset";
@@ -418,6 +428,7 @@ struct TrayMenu {
     auto_close: CheckMenuItem,
     low_mem: CheckMenuItem,
     no_gpu: CheckMenuItem,
+    no_sw: CheckMenuItem,
     autostart: CheckMenuItem,
     hotkeys: CheckMenuItem,
     mailto: CheckMenuItem,
@@ -451,11 +462,12 @@ fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> 
     );
     let low_mem = check(id::LOW_MEM, "Hemat RAM (rapikan memori saat tersembunyi)", false);
     let no_gpu = check(id::NO_GPU, "Tanpa GPU (hemat RAM, berlaku setelah restart)", false);
+    let no_sw = check(id::NO_SW, "Tanpa service worker Outlook (hemat RAM)", false);
     let autostart = check(id::AUTOSTART, "Mulai dengan Windows", false);
     let hotkeys = check(id::HOTKEYS, &hotkey_label(s), false);
     let mailto = check(id::MAILTO, "Aplikasi email default (mailto)", false);
     let auto_update = check(id::AUTO_UPDATE, "Update otomatis", false);
-    let diag = check(id::DIAG_RAM, "Diagnostik RAM", false);
+    let diag = check(id::DIAG_RAM, "Catat diagnostik (RAM && CPU tiap 30 detik)", false);
     let restart_update = MenuItem::with_id(id::RESTART_UPDATE, "Tidak ada update", false, None);
 
     let notif = Submenu::with_items(
@@ -477,6 +489,7 @@ fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> 
             &auto_close,
             &low_mem,
             &no_gpu,
+            &no_sw,
             &sep(),
             &item(id::ZOOM_IN, "Perbesar tampilan"),
             &item(id::ZOOM_OUT, "Perkecil tampilan"),
@@ -494,6 +507,7 @@ fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> 
             &item(id::CHECK_UPDATE, "Cek update sekarang"),
             &diag,
             &sep(),
+            &item(id::DIAG_REPORT, "Buat laporan diagnostik (untuk dikirim)"),
             &item(id::INSPECT, "Diagnostik halaman Outlook"),
             &item(id::OPEN_FOLDER, "Buka folder pengaturan"),
             &item(id::OPEN_APP_FOLDER, "Buka folder aplikasi"),
@@ -544,6 +558,7 @@ fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> 
             auto_close,
             low_mem,
             no_gpu,
+            no_sw,
             autostart,
             hotkeys,
             mailto,
@@ -621,14 +636,17 @@ struct App {
     hk_toggle: Option<u32>,
     hk_compose: Option<u32>,
 
-    ram: Option<win::TreeMem>,
+    last_row: Option<diag::Row>,
+    sampler: diag::Sampler,
+    next_sample: Option<Instant>,
+    diag_notes: Vec<String>,
+    diag_state: Option<diag::State>,
     trim_at: Option<Instant>,
     hidden_since: Option<Instant>,
     page_fresh_at: Option<Instant>,
     last_refresh_check: Option<Instant>,
     settle_until: Option<Instant>,
     low_unfocused: bool,
-    last_diag: Option<Instant>,
 
     update_running: bool,
     last_update_check: Option<Instant>,
@@ -700,12 +718,8 @@ impl App {
                 "tidak ada yang belum dibaca".into()
             });
         }
-        if let Some(m) = self.ram {
-            parts.push(format!(
-                "RAM {} MB ({} proses)",
-                m.working / (1024 * 1024),
-                m.count
-            ));
+        if let Some(r) = &self.last_row {
+            parts.push(format!("RAM {:.0} MB, CPU {:.1}% ({} proses)", r.ram_mb, r.cpu, r.procs));
         }
         parts.join(" • ")
     }
@@ -770,6 +784,7 @@ impl App {
         m.auto_close.set_checked(s.auto_close);
         m.low_mem.set_checked(s.low_memory);
         m.no_gpu.set_checked(s.no_gpu);
+        m.no_sw.set_checked(s.block_service_worker);
         m.autostart.set_checked(s.autostart);
         m.hotkeys.set_checked(s.hotkeys);
         m.mailto.set_checked(win::mailto_registered());
@@ -981,7 +996,10 @@ impl App {
             }
         };
 
-        let cfg = serde_json::json!({ "sel": self.settings.unread_selector });
+        let cfg = serde_json::json!({
+            "sel": self.settings.unread_selector,
+            "nosw": self.settings.block_service_worker,
+        });
         let init_js = format!("window.__oliteCfg = {cfg};\n{MONITOR_JS}");
         let zoom = self.settings.zoom;
         let low = self.settings.low_memory;
@@ -1282,6 +1300,174 @@ impl App {
         }
     }
 
+    /// Buat ulang WebView (mis. setelah pengaturan skrip halaman berubah).
+    fn recreate_instance(&mut self, target: &EventLoopWindowTarget<UserEvent>) {
+        let Some(visible) = self.inst.as_ref().map(|i| i.visible && !i.minimized) else {
+            return;
+        };
+        self.destroy_instance();
+        if visible {
+            self.show(target, None);
+        } else if self.active_mode() == Mode::Siaga {
+            self.create_instance(target, MAIL_URL, false);
+        }
+    }
+
+    // ----- diagnostik -----
+
+    fn diag_state_now(&self) -> diag::State {
+        match &self.inst {
+            None => diag::State::Jeda,
+            Some(i) if !i.visible => diag::State::Tray,
+            Some(i) if i.minimized => diag::State::Minimize,
+            Some(_) if self.focused => diag::State::Dipakai,
+            Some(_) => diag::State::TakFokus,
+        }
+    }
+
+    /// Catat kejadian; ikut di kolom "catatan" sampel berikutnya.
+    fn diag_note(&mut self, note: &str) {
+        if self.settings.diagnostics && self.diag_notes.len() < 20 {
+            self.diag_notes.push(note.to_string());
+        }
+    }
+
+    fn take_sample(&mut self) {
+        let kinds = self
+            .inst
+            .as_ref()
+            .map(|i| win::webview_process_kinds(&i.webview))
+            .unwrap_or_default();
+        let procs = win::process_snapshot(&kinds);
+        let note = std::mem::take(&mut self.diag_notes).join(" | ");
+        let row = self.sampler.row(
+            Instant::now(),
+            Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            self.diag_state_now(),
+            &procs,
+            self.shown_unread(),
+            &note,
+        );
+        diag::append_row(&self.dir, &row);
+        self.last_row = Some(row);
+    }
+
+    fn diag_tick(&mut self, now: Instant) {
+        if !self.settings.diagnostics {
+            return;
+        }
+        let state = self.diag_state_now();
+        if self.diag_state != Some(state) {
+            if let Some(prev) = self.diag_state {
+                self.diag_note(&format!("{} -> {}", prev.label(), state.label()));
+                let soon = now + DIAG_AFTER_CHANGE;
+                self.next_sample = Some(self.next_sample.map_or(soon, |t| t.min(soon)));
+            }
+            self.diag_state = Some(state);
+        }
+        let due = *self.next_sample.get_or_insert(now);
+        if now >= due {
+            self.take_sample();
+            self.next_sample = Some(now + DIAG_EVERY);
+        }
+        if let Some(t) = self.next_sample {
+            self.next_tick = self.next_tick.min(t);
+        }
+    }
+
+    /// Satu file berisi semua yang dibutuhkan untuk perbaikan: versi, sistem, pengaturan,
+    /// ringkasan RAM/CPU per keadaan, log, dan data mentah. Tanpa isi email.
+    fn write_report(&mut self) {
+        use std::fmt::Write as _;
+        if self.settings.diagnostics {
+            self.diag_note("laporan dibuat");
+            self.take_sample();
+        }
+        let rows = diag::read_rows(&self.dir);
+        let mut r = String::new();
+        let _ = writeln!(r, "LAPORAN DIAGNOSTIK OUTLOOK LITE");
+        let _ = writeln!(r, "Dibuat: {}", Local::now().format("%Y-%m-%d %H:%M:%S"));
+        let _ = writeln!(r, "Versi aplikasi: {VERSION}");
+        let _ = writeln!(
+            r,
+            "WebView2 Runtime: {}",
+            wry::webview_version().unwrap_or_else(|_| "?".into())
+        );
+        let _ = writeln!(
+            r,
+            "CPU logis: {}",
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+        );
+        r.push_str(&win::system_info());
+        let _ = writeln!(r, "Keadaan sekarang: {}", self.diag_state_now().label());
+        let _ = writeln!(r, "Status: {}", self.status_text());
+        let _ = writeln!(r, "Argumen WebView2: {}", self.browser_args);
+        let _ = writeln!(r);
+
+        let _ = writeln!(r, "== Ringkasan RAM (MB) dan CPU (%) per keadaan ==");
+        if rows.is_empty() {
+            let _ = writeln!(
+                r,
+                "Belum ada data. Aktifkan Pengaturan > Catat diagnostik, pakai aplikasi seperti biasa\n\
+                 (buka, minimize, tutup ke tray) minimal 30 menit, lalu buat laporan lagi."
+            );
+        } else {
+            let _ = writeln!(
+                r,
+                "{} sampel, {} s.d. {}",
+                rows.len(),
+                rows.first().map(|x| x.time.as_str()).unwrap_or(""),
+                rows.last().map(|x| x.time.as_str()).unwrap_or("")
+            );
+            r.push_str(&diag::summarize(&rows));
+        }
+        let _ = writeln!(r);
+
+        let _ = writeln!(r, "== Pengaturan ==");
+        let mut st = self.settings.clone();
+        st.window = None;
+        let _ = writeln!(r, "{}", serde_json::to_string_pretty(&st).unwrap_or_default());
+        let _ = writeln!(r);
+
+        let _ = writeln!(r, "== Log (300 baris terakhir) ==");
+        let mut log_lines: Vec<String> = Vec::new();
+        for name in ["outlook-lite.old.log", "outlook-lite.log"] {
+            if let Ok(s) = std::fs::read_to_string(self.dir.join(name)) {
+                log_lines.extend(s.lines().map(str::to_string));
+            }
+        }
+        let skip = log_lines.len().saturating_sub(300);
+        for l in &log_lines[skip..] {
+            let _ = writeln!(r, "{l}");
+        }
+        let _ = writeln!(r);
+
+        let _ = writeln!(r, "== Data mentah (1000 sampel terakhir) ==");
+        let _ = writeln!(r, "{}", diag::CSV_HEADER);
+        let skip = rows.len().saturating_sub(1000);
+        for row in &rows[skip..] {
+            let _ = writeln!(r, "{}", row.to_csv());
+        }
+
+        let path = self.dir.join("laporan-diagnostik.txt");
+        let _ = std::fs::create_dir_all(&self.dir);
+        match std::fs::write(&path, r) {
+            Ok(()) => {
+                win::reveal_file(&path);
+                win::open_in_notepad(&path);
+                if !self.settings.diagnostics {
+                    self.toast(
+                        "Laporan dibuat",
+                        "Catat diagnostik belum aktif: aktifkan dulu agar laporan berisi data RAM & CPU.",
+                        None,
+                        Some(false),
+                    );
+                }
+            }
+            Err(e) => self.log(&format!("laporan gagal: {e}")),
+        }
+    }
+
     /// Hemat RAM berkala (dipanggil dari tick).
     fn manage_memory(&mut self, now: Instant) {
         if !self.settings.low_memory {
@@ -1309,9 +1495,14 @@ impl App {
         // Rapikan working set proses WebView2.
         if let Some(t) = self.trim_at {
             if now >= t {
+                if self.settings.diagnostics {
+                    self.diag_note("sebelum rapikan");
+                    self.take_sample();
+                }
                 let n = win::trim_process_tree();
                 if self.settings.diagnostics {
-                    self.log(&format!("memori dirapikan ({n} proses)"));
+                    self.diag_note(&format!("sesudah rapikan ({n} proses)"));
+                    self.next_sample = Some(now + Duration::from_secs(5));
                 }
                 self.trim_at = Some(now + TRIM_EVERY);
             } else {
@@ -1344,10 +1535,12 @@ impl App {
                 .page_fresh_at
                 .is_some_and(|t| t.elapsed() >= Duration::from_secs(s.refresh_hours as u64 * 3600));
         if too_big || too_old {
-            self.log(&format!(
-                "Outlook tersembunyi disegarkan ({}; memori {commit_mb} MB)",
+            let why = format!(
+                "segarkan Outlook ({}; commit {commit_mb} MB)",
                 if too_big { "memori besar" } else { "berjalan lama" }
-            ));
+            );
+            self.log(&why);
+            self.diag_note(&why);
             if let Some(inst) = &self.inst {
                 let _ = inst.webview.load_url(MAIL_URL);
             }
@@ -1423,7 +1616,16 @@ impl App {
         let (title, l1, l2) = mailalert::texts(&alert, self.settings.show_details);
         // Outlook sudah membunyikan suaranya sendiri: jangan dobel.
         let sound = self.settings.sound && !outlook_sound && !self.sound_recent();
-        self.log(&format!("toast: {title} / {l1}"));
+        let what = match &alert {
+            mailalert::Alert::Mail { new, total, .. } => format!(
+                "toast email baru: {} (belum dibaca {})",
+                new.map_or("?".into(), |n| n.to_string()),
+                total.map_or("?".into(), |n| n.to_string())
+            ),
+            mailalert::Alert::Other { .. } => "toast pengingat/pemberitahuan Outlook".into(),
+        };
+        self.log(&what);
+        self.diag_note(&what);
         self.toast3(&title, &l1, &l2, click, Some(sound));
     }
 
@@ -1506,6 +1708,7 @@ impl App {
             return;
         }
         self.needs_login = true;
+        self.diag_note("perlu login");
         self.log("halaman login bertahan; notifikasi berhenti sampai login");
         let cooled = self
             .last_login_toast
@@ -1723,15 +1926,7 @@ impl App {
             }
         }
 
-        // Diagnostik RAM.
-        if self.settings.diagnostics {
-            if self.last_diag.is_none_or(|t| t.elapsed() >= DIAG_EVERY) {
-                self.last_diag = Some(now);
-                self.ram = win::process_tree_memory();
-            }
-        } else {
-            self.ram = None;
-        }
+        self.diag_tick(now);
 
         // Update otomatis.
         if self.settings.auto_update && self.update_ready.is_none() {
@@ -1846,7 +2041,26 @@ impl App {
             }
             id::DIAG_RAM => {
                 self.settings.diagnostics = !self.settings.diagnostics;
-                self.last_diag = None;
+                self.next_sample = None;
+                self.diag_state = None;
+                self.last_row = None;
+                if self.settings.diagnostics {
+                    self.diag_note("diagnostik dimulai");
+                }
+            }
+            id::DIAG_REPORT => {
+                changed = false;
+                self.write_report();
+            }
+            id::NO_SW => {
+                self.settings.block_service_worker = !self.settings.block_service_worker;
+                self.diag_note(if self.settings.block_service_worker {
+                    "service worker dimatikan"
+                } else {
+                    "service worker diizinkan"
+                });
+                // Skrip halaman dipasang saat WebView dibuat: buat ulang.
+                self.recreate_instance(target);
             }
             id::INSPECT => {
                 changed = false;
@@ -2167,14 +2381,19 @@ fn main() {
         hk_registered: Vec::new(),
         hk_toggle: None,
         hk_compose: None,
-        ram: None,
+        last_row: None,
+        sampler: diag::Sampler::new(
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+        ),
+        next_sample: None,
+        diag_notes: Vec::new(),
+        diag_state: None,
         trim_at: None,
         hidden_since: None,
         page_fresh_at: None,
         last_refresh_check: None,
         settle_until: None,
         low_unfocused: false,
-        last_diag: None,
         update_running: false,
         last_update_check: None,
         update_ready: None,

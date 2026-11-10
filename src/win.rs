@@ -296,26 +296,34 @@ mod imp {
         tree
     }
 
-    /// Memori proses ini + semua turunannya. `working` sama dengan kolom Memory di Task Manager.
-    pub fn process_tree_memory() -> Option<TreeMem> {
-        use windows::Win32::Foundation::CloseHandle;
+    /// Snapshot RAM dan waktu CPU proses ini + semua turunannya (proses WebView2).
+    /// `kinds` = jenis proses menurut WebView2 (PID yang tidak ada di sana = Lain).
+    pub fn process_snapshot(
+        kinds: &std::collections::HashMap<u32, crate::diag::Kind>,
+    ) -> Vec<crate::diag::Proc> {
+        use windows::Win32::Foundation::{CloseHandle, FILETIME};
         use windows::Win32::System::ProcessStatus::{
             GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
         };
-        use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
-
-        let tree = tree_pids();
-        if tree.is_empty() {
-            return None;
-        }
-        let mut m = TreeMem {
-            count: tree.len() as u32,
-            ..Default::default()
+        use windows::Win32::System::Threading::{
+            GetCurrentProcessId, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
-        for &pid in &tree {
+        let me = unsafe { GetCurrentProcessId() };
+        let ft = |f: FILETIME| ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64;
+        let mut out = Vec::new();
+        for pid in tree_pids() {
             unsafe {
                 let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
                     continue;
+                };
+                let mut p = crate::diag::Proc {
+                    pid,
+                    kind: if pid == me {
+                        Some(crate::diag::Kind::Aplikasi)
+                    } else {
+                        kinds.get(&pid).copied()
+                    },
+                    ..Default::default()
                 };
                 let mut pmc = PROCESS_MEMORY_COUNTERS_EX2 {
                     cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32,
@@ -328,17 +336,112 @@ mod imp {
                 )
                 .is_ok()
                 {
-                    m.working += if pmc.PrivateWorkingSetSize > 0 {
+                    p.working = if pmc.PrivateWorkingSetSize > 0 {
                         pmc.PrivateWorkingSetSize
                     } else {
                         pmc.WorkingSetSize
                     } as u64;
-                    m.commit += pmc.PrivateUsage as u64;
+                    p.commit = pmc.PrivateUsage as u64;
+                }
+                let (mut c, mut e, mut k, mut u) = (
+                    FILETIME::default(),
+                    FILETIME::default(),
+                    FILETIME::default(),
+                    FILETIME::default(),
+                );
+                if GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u).is_ok() {
+                    p.cpu_time = ft(k) + ft(u);
                 }
                 let _ = CloseHandle(h);
+                out.push(p);
             }
         }
-        Some(m)
+        out
+    }
+
+    /// Memori proses ini + semua turunannya. `working` sama dengan kolom Memory di Task Manager.
+    pub fn process_tree_memory() -> Option<TreeMem> {
+        let procs = process_snapshot(&Default::default());
+        if procs.is_empty() {
+            return None;
+        }
+        Some(TreeMem {
+            working: procs.iter().map(|p| p.working).sum(),
+            commit: procs.iter().map(|p| p.commit).sum(),
+            count: procs.len() as u32,
+        })
+    }
+
+    /// Jenis tiap proses WebView2 (browser, renderer, GPU, utility) menurut WebView2 sendiri.
+    pub fn webview_process_kinds(
+        webview: &wry::WebView,
+    ) -> std::collections::HashMap<u32, crate::diag::Kind> {
+        use crate::diag::Kind;
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            ICoreWebView2Environment8, ICoreWebView2_2, COREWEBVIEW2_PROCESS_KIND,
+            COREWEBVIEW2_PROCESS_KIND_BROWSER, COREWEBVIEW2_PROCESS_KIND_GPU,
+            COREWEBVIEW2_PROCESS_KIND_RENDERER, COREWEBVIEW2_PROCESS_KIND_UTILITY,
+        };
+        use windows::core::Interface;
+        use wry::WebViewExtWindows;
+        let mut map = std::collections::HashMap::new();
+        let res: windows::core::Result<()> = (|| unsafe {
+            let wv2: ICoreWebView2_2 = webview.webview().cast()?;
+            let env: ICoreWebView2Environment8 = wv2.Environment()?.cast()?;
+            let list = env.GetProcessInfos()?;
+            let mut n = 0u32;
+            list.Count(&mut n)?;
+            for i in 0..n {
+                let info = list.GetValueAtIndex(i)?;
+                let mut pid = 0i32;
+                let mut kind = COREWEBVIEW2_PROCESS_KIND::default();
+                info.ProcessId(&mut pid)?;
+                info.Kind(&mut kind)?;
+                let k = match kind {
+                    COREWEBVIEW2_PROCESS_KIND_BROWSER => Kind::Browser,
+                    COREWEBVIEW2_PROCESS_KIND_RENDERER => Kind::Renderer,
+                    COREWEBVIEW2_PROCESS_KIND_GPU => Kind::Gpu,
+                    COREWEBVIEW2_PROCESS_KIND_UTILITY => Kind::Utility,
+                    _ => Kind::Lain,
+                };
+                map.insert(pid as u32, k);
+            }
+            Ok(())
+        })();
+        let _ = res;
+        map
+    }
+
+    /// Ringkasan sistem untuk laporan diagnostik (tanpa data pribadi).
+    pub fn system_info() -> String {
+        use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        use winreg::enums::HKEY_LOCAL_MACHINE;
+        let mut out = String::new();
+        if let Ok(k) = RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
+        {
+            let get = |n: &str| k.get_value::<String, _>(n).unwrap_or_default();
+            let ubr: u32 = k.get_value("UBR").unwrap_or(0);
+            out.push_str(&format!(
+                "Windows: {} {} (build {}.{ubr})\n",
+                get("ProductName"),
+                get("DisplayVersion"),
+                get("CurrentBuild")
+            ));
+        }
+        let mut m = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GlobalMemoryStatusEx(&mut m) }.is_ok() {
+            out.push_str(&format!(
+                "RAM: {:.1} GB total, {:.1} GB tersedia saat ini ({}% terpakai)\n",
+                m.ullTotalPhys as f64 / 1073741824.0,
+                m.ullAvailPhys as f64 / 1073741824.0,
+                m.dwMemoryLoad
+            ));
+        }
+        out
     }
 
     /// Kosongkan working set proses WebView2 (dan proses ini). Halaman yang jarang disentuh
@@ -430,6 +533,19 @@ mod imp {
     pub fn refresh_registrations(_exe: &Path) {}
     pub fn process_tree_memory() -> Option<TreeMem> {
         None
+    }
+    pub fn process_snapshot(
+        _kinds: &std::collections::HashMap<u32, crate::diag::Kind>,
+    ) -> Vec<crate::diag::Proc> {
+        Vec::new()
+    }
+    pub fn webview_process_kinds(
+        _webview: &wry::WebView,
+    ) -> std::collections::HashMap<u32, crate::diag::Kind> {
+        Default::default()
+    }
+    pub fn system_info() -> String {
+        String::new()
     }
     pub fn trim_process_tree() -> u32 {
         0

@@ -68,8 +68,12 @@ pub struct Settings {
     pub hotkey_warned: String,
     pub auto_update: bool,
     pub diagnostics: bool,
-    /// Matikan akselerasi GPU (berlaku setelah restart).
+    /// Matikan akselerasi GPU (berlaku setelah restart). Hemat ~50-80 MB.
     pub no_gpu: bool,
+    /// Matikan service worker Outlook (proses renderer tambahan ~30-45 MB).
+    pub block_service_worker: bool,
+    /// V8 mengutamakan ukuran memori (berlaku setelah restart).
+    pub v8_optimize_for_size: bool,
     /// Pisahkan iframe lintas-situs ke proses sendiri (lebih banyak proses & RAM). Berlaku setelah restart.
     pub site_isolation: bool,
     /// Argumen tambahan WebView2 (lanjutan, berlaku setelah restart).
@@ -111,7 +115,9 @@ impl Default for Settings {
             hotkey_warned: String::new(),
             auto_update: true,
             diagnostics: false,
-            no_gpu: false,
+            no_gpu: true,
+            block_service_worker: true,
+            v8_optimize_for_size: true,
             site_isolation: false,
             extra_browser_args: String::new(),
         }

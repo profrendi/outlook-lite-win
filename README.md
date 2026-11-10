@@ -67,9 +67,9 @@ Klik kiri ikon = buka jendela. Klik kanan:
 - **Status** (mode, jumlah belum dibaca, RAM bila diagnostik aktif)
 - Buka Email · Buka Kalender · Email baru · Pintasan · **Cek email sekarang**
 - **Notifikasi**: hanya jam kerja, bunyi, tampilkan pengirim & subjek, **Tes notifikasi**, mode kompatibel
-- **Jendela**: tutup otomatis saat tidak aktif, hemat RAM, tanpa GPU, zoom
+- **Jendela**: tutup otomatis saat tidak aktif, hemat RAM, tanpa GPU, tanpa service worker, zoom
 - **Pengaturan**: mulai dengan Windows, hotkey, aplikasi email default (mailto),
-  update otomatis, cek update, diagnostik RAM, diagnostik halaman Outlook,
+  update otomatis, cek update, catat diagnostik, buat laporan diagnostik, diagnostik halaman Outlook,
   buka folder pengaturan, buka folder aplikasi, muat ulang pengaturan, hapus instalasi
 - Restart untuk memakai versi baru · Tutup jendela · Keluar
 
@@ -95,9 +95,9 @@ Ikon tray: **titik merah** = ada email belum dibaca, **titik kuning** = perlu lo
 
 | Keadaan | Yang dilakukan |
 |---|---|
-| Selalu | Tanpa proses renderer cadangan, tanpa cache halaman sebelumnya, iframe Microsoft berbagi proses dengan Outlook (lebih sedikit proses) |
-| Dipakai, tapi tidak difokus > 3 menit | WebView2 diminta memakai memori rendah; normal lagi saat jendela difokus |
-| Diminimalkan / di tray | Tampilan WebView2 dimatikan, memori rendah, lalu memori proses WebView2 dirapikan 20 detik kemudian dan tiap 15 menit |
+| Selalu | Tanpa GPU, tanpa service worker Outlook, V8 hemat memori, tanpa proses renderer cadangan, tanpa cache halaman sebelumnya, iframe Microsoft berbagi proses dengan Outlook |
+| Dipakai, tapi tidak difokus > 1 menit | WebView2 diminta memakai memori rendah; normal lagi saat jendela difokus |
+| Diminimalkan / di tray | Tampilan WebView2 dimatikan, memori rendah, lalu memori proses WebView2 dirapikan 20 detik kemudian dan tiap 5 menit |
 | Di tray berjam-jam | Outlook disegarkan otomatis bila memorinya melebihi 700 MB atau sudah berjalan 8 jam (hanya bila tersembunyi ≥ 10 menit dan tidak sedang menulis email) |
 | Di luar jam kerja | Outlook tersembunyi ditutup |
 
@@ -105,8 +105,26 @@ Merapikan memori melepas halaman yang jarang disentuh dari RAM fisik; Windows me
 kembali saat dibutuhkan, jadi angka di Task Manager bisa naik perlahan lagi. Saat jendela
 dibuka setelah lama di tray, tampilan pertama bisa terasa sedikit lebih lambat.
 
-**Tanpa GPU** (menu Jendela, perlu restart) menghilangkan proses GPU. Hemat RAM, tapi
-gulir terasa sedikit kurang halus.
+Di menu **Jendela** (bawaan aktif):
+- **Tanpa GPU** (perlu restart): proses GPU turun dari ~70–90 MB ke ~13 MB. Gulir sedikit
+  kurang halus.
+- **Tanpa service worker Outlook**: menghapus satu proses (~30–45 MB) yang hanya dipakai
+  Outlook untuk cache/offline. Outlook mungkin sedikit lebih lama terbuka pertama kali.
+  Notifikasi tidak terpengaruh.
+
+## Laporan diagnostik (RAM & CPU)
+
+1. Tray > Pengaturan > centang **Catat diagnostik (RAM & CPU tiap 30 detik)**.
+2. Pakai seperti biasa (buka, minimize, tutup ke tray) setidaknya 30–60 menit.
+3. Tray > Pengaturan > **Buat laporan diagnostik**. File `laporan-diagnostik.txt` terbuka di
+   Notepad dan Explorer. Kirim file itu.
+
+Isi laporan: versi aplikasi, Windows, WebView2, RAM PC, pengaturan, ringkasan RAM/CPU per
+keadaan (dipakai, tak-fokus, minimize, tray, jeda), 300 baris log terakhir, dan data mentah
+per 30 detik: RAM & CPU per jenis proses (aplikasi, WebView2 Manager, renderer Outlook,
+renderer lain, GPU, utility), jumlah belum dibaca, dan kejadian (pindah keadaan, rapikan
+memori sebelum/sesudah, segarkan, toast, perlu login). Tidak berisi pengirim, subjek, atau
+isi email. Data mentah juga ada di `diagnostik.csv`.
 
 ## settings.json
 
@@ -129,12 +147,14 @@ Di `%LOCALAPPDATA%\OutlookLite\settings.json`. Setelah diubah manual, pilih
   "refresh_mb": 700,
   "refresh_hours": 8,
   "site_isolation": false,
-  "no_gpu": false
+  "no_gpu": true,
+  "block_service_worker": true,
+  "v8_optimize_for_size": true
 }
 ```
 
 `refresh_mb` / `refresh_hours` = 0 mematikan penyegaran otomatis. `site_isolation`, `no_gpu`,
-dan `extra_browser_args` berlaku setelah aplikasi di-restart.
+`v8_optimize_for_size`, dan `extra_browser_args` berlaku setelah aplikasi di-restart.
 
 ## Diagnostik halaman (jika jumlah belum dibaca tidak terbaca)
 
