@@ -59,6 +59,27 @@ pub fn rgba(size: u32, badge: Badge) -> Vec<u8> {
     px
 }
 
+/// Titik merah berbingkai putih (overlay ikon taskbar).
+pub fn dot(size: u32) -> Vec<u8> {
+    let n = size as f32;
+    let c = (n - 1.0) / 2.0;
+    let mut px = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let r = ((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt();
+            let p: [u8; 4] = if r <= n * 0.36 {
+                [232, 17, 35, 255]
+            } else if r <= n * 0.48 {
+                [255, 255, 255, 255]
+            } else {
+                [0, 0, 0, 0]
+            };
+            px.extend_from_slice(&p);
+        }
+    }
+    px
+}
+
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &b in data {

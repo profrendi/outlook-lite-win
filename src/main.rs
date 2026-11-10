@@ -49,7 +49,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const INSTANCE_PORT: u16 = 47193;
 const MAGIC: &str = "OUTLOOKLITE1";
 /// Argumen bawaan wry yang harus dipertahankan saat kita menambah argumen sendiri.
-const WRY_DEFAULT_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection";
+/// IntensiveWakeUpThrottling dimatikan supaya halaman tersembunyi tidak diperlambat.
+const WRY_DEFAULT_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,IntensiveWakeUpThrottling";
+/// Izinkan Outlook membunyikan suara email masuk tanpa klik pengguna (seperti PWA).
+const AUTOPLAY_ARGS: &str = "--autoplay-policy=no-user-gesture-required";
 /// Jangan perlambat halaman tersembunyi (penting untuk notifikasi di mode Siaga).
 const BG_ARGS: &str = "--disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows";
 const MONITOR_JS: &str = include_str!("js/monitor.js");
@@ -64,7 +67,11 @@ const UPDATE_EVERY: Duration = Duration::from_secs(24 * 3600);
 const UPDATE_FIRST_DELAY: Duration = Duration::from_secs(90);
 const DIAG_EVERY: Duration = Duration::from_secs(10);
 /// Halaman login yang bertahan lebih lama dari ini (bukan sekadar redirect SSO) = perlu login.
-const LOGIN_GRACE: Duration = Duration::from_secs(40);
+const LOGIN_GRACE: Duration = Duration::from_secs(120);
+/// Peringatan "perlu login" paling sering sekali per jangka waktu ini.
+const LOGIN_TOAST_COOLDOWN: Duration = Duration::from_secs(3 * 3600);
+/// Jeda setelah suara Outlook sebelum toast, menunggu sinyal yang lebih lengkap.
+const SOUND_WAIT: Duration = Duration::from_millis(2500);
 
 // ---------------------------------------------------------------------------
 // Event
@@ -88,6 +95,8 @@ enum RemoteCmd {
 enum PageMsg {
     State { unread: i64, composing: bool },
     Notify { id: u64, title: String, body: String },
+    Badge(i64),
+    Sound,
     Inspect(String),
 }
 
@@ -113,6 +122,8 @@ fn parse_page_msg(body: &str) -> Option<PageMsg> {
             title: s("title", 300),
             body: s("body", 600),
         }),
+        "badge" => Some(PageMsg::Badge(v.get("count")?.as_i64()?.clamp(0, 1_000_000))),
+        "sound" => Some(PageMsg::Sound),
         "inspect" => Some(PageMsg::Inspect(
             v.get("data")?.as_str()?.chars().take(300_000).collect(),
         )),
@@ -508,7 +519,12 @@ struct App {
     composing: bool,
 
     unread: Option<i64>,
-    last_hook: Option<Instant>,
+    badge_unread: Option<i64>,
+    last_alert: Option<Instant>,
+    last_sound: Option<Instant>,
+    pending_sound: Option<Instant>,
+    last_login_toast: Option<Instant>,
+    overlay_on: bool,
     needs_login: bool,
     login_toasted: bool,
     login_seen_at: Option<Instant>,
@@ -592,7 +608,7 @@ impl App {
         }
         if self.needs_login {
             parts.push("perlu login".into());
-        } else if let Some(n) = self.unread {
+        } else if let Some(n) = self.shown_unread() {
             parts.push(if n > 0 {
                 format!("{n} belum dibaca")
             } else {
@@ -608,7 +624,7 @@ impl App {
     fn refresh_tray(&mut self) {
         let badge = if self.needs_login {
             Badge::Warning
-        } else if self.unread.unwrap_or(0) > 0 {
+        } else if self.shown_unread().unwrap_or(0) > 0 {
             Badge::Unread
         } else {
             Badge::None
@@ -628,8 +644,19 @@ impl App {
         }
         self.badge = badge;
         self.last_tip = tip;
+        let has_unread = self.shown_unread().unwrap_or(0) > 0;
         if let Some(i) = &self.inst {
-            let n = self.unread.unwrap_or(0);
+            // Tanda merah di ikon taskbar, seperti PWA Outlook.
+            if has_unread != self.overlay_on {
+                #[cfg(windows)]
+                {
+                    use tao::platform::windows::WindowExtWindows;
+                    let img = WindowIcon::from_rgba(icon::dot(32), 32, 32).ok();
+                    i.window.set_overlay_icon(if has_unread { img.as_ref() } else { None });
+                }
+                self.overlay_on = has_unread;
+            }
+            let n = self.shown_unread().unwrap_or(0);
             let title = if n > 0 {
                 format!("Outlook Lite ({n})")
             } else {
@@ -750,15 +777,27 @@ impl App {
                 Err(e) => errors.push(format!("{text}: {e}")),
             }
         }
-        if !errors.is_empty() {
+        if errors.is_empty() {
+            if !self.settings.hotkey_warned.is_empty() {
+                self.settings.hotkey_warned.clear();
+                self.dirty = true;
+            }
+        } else {
             let msg = errors.join("; ");
-            self.log(&format!("hotkey: {msg}"));
-            self.toast(
-                "Hotkey tidak bisa dipasang",
-                &format!("{msg}. Mungkin sudah dipakai aplikasi lain; ubah di settings.json."),
-                None,
-                Some(false),
-            );
+            self.log(&format!("hotkey gagal: {msg}"));
+            // Beri tahu sekali saja untuk kombinasi yang sama, bukan di setiap start.
+            if self.settings.hotkey_warned != msg {
+                self.settings.hotkey_warned = msg.clone();
+                self.dirty = true;
+                self.toast(
+                    "Hotkey sudah dipakai aplikasi lain",
+                    &format!(
+                        "{msg}. Fitur lain tetap jalan. Ganti lewat Pengaturan > Buka folder pengaturan > settings.json (hotkey_toggle / hotkey_compose), lalu Muat ulang pengaturan."
+                    ),
+                    None,
+                    Some(false),
+                );
+            }
         }
     }
 
@@ -868,10 +907,16 @@ impl App {
             }
         };
         let _ = webview.zoom(zoom);
-        if !visible && low {
-            set_memory_low(&webview, true);
+        if !visible {
+            // Beri tahu WebView2 bahwa halaman tidak terlihat supaya ia berhemat
+            // (halaman tetap berjalan, seperti tab di latar belakang).
+            let _ = webview.set_visible(false);
+            if low {
+                set_memory_low(&webview, true);
+            }
         }
         self.create_failed_at = None;
+        self.overlay_on = false;
         self.focused = false;
         self.unfocused_since = visible.then(Instant::now);
         self.inst = Some(Instance {
@@ -908,6 +953,7 @@ impl App {
             if !inst.visible {
                 inst.window.set_visible(true);
                 inst.visible = true;
+                self.overlay_on = false; // tombol taskbar baru: pasang ulang tanda merah
                 if self.settings.window.is_some_and(|g| g.maximized) {
                     inst.window.set_maximized(true);
                 }
@@ -915,10 +961,8 @@ impl App {
             if inst.window.is_minimized() {
                 inst.window.set_minimized(false);
             }
-            if inst.suspended {
-                let _ = inst.webview.set_visible(true);
-                inst.suspended = false;
-            }
+            let _ = inst.webview.set_visible(true); // juga melanjutkan halaman yang ditangguhkan
+            inst.suspended = false;
             inst.minimized = false;
             set_memory_low(&inst.webview, false);
             inst.window.set_focus();
@@ -942,6 +986,8 @@ impl App {
             if let Some(inst) = self.inst.as_mut() {
                 inst.window.set_visible(false);
                 inst.visible = false;
+                // Sama seperti minimize: WebView2 berhemat, halaman tetap memantau.
+                let _ = inst.webview.set_visible(false);
                 // Pemantauan hanya jalan di halaman Outlook (bukan pintasan seperti To Do).
                 if !inst.webview.url().is_ok_and(|u| is_outlook_url(&u)) {
                     let _ = inst.webview.load_url(MAIL_URL);
@@ -995,7 +1041,7 @@ impl App {
     }
 
     fn on_resized(&mut self) {
-        let siaga = self.active_mode() == Mode::Siaga;
+        let mati = self.active_mode() == Mode::Mati;
         let low = self.settings.low_memory;
         let Some(inst) = self.inst.as_mut() else { return };
         if inst.window.is_minimized() {
@@ -1003,8 +1049,8 @@ impl App {
                 inst.minimized = true;
                 if low {
                     set_memory_low(&inst.webview, true);
-                    // Di Siaga halaman harus tetap aktif untuk notifikasi.
-                    if !siaga {
+                    // Halaman hanya ditidurkan di mode Mati; Hemat & Siaga tetap memantau.
+                    if mati {
                         let _ = inst.webview.set_visible(false);
                         win::try_suspend(&inst.webview);
                         inst.suspended = true;
@@ -1030,12 +1076,15 @@ impl App {
         if manual {
             self.manual_check = true;
         }
-        if let Some(inst) = &self.inst {
-            // Outlook sudah hidup: minta pemantau melapor sekarang juga.
+        if self.inst.is_some() {
+            // Outlook sudah hidup: bangunkan bila tidur, lalu minta pemantau melapor.
+            self.wake_page();
             if manual {
-                let _ = inst
-                    .webview
-                    .evaluate_script("window.__oliteForce && window.__oliteForce()");
+                if let Some(inst) = &self.inst {
+                    let _ = inst
+                        .webview
+                        .evaluate_script("window.__oliteForce && window.__oliteForce()");
+                }
                 self.bg_deadline
                     .get_or_insert(Instant::now() + Duration::from_secs(20));
             }
@@ -1046,6 +1095,92 @@ impl App {
         } else {
             self.manual_check = false;
         }
+    }
+
+    /// Lanjutkan halaman yang ditangguhkan (minimize di mode Mati).
+    fn wake_page(&mut self) {
+        if let Some(inst) = self.inst.as_mut() {
+            if inst.suspended {
+                let _ = inst.webview.set_visible(true);
+                inst.suspended = false;
+            }
+        }
+    }
+
+    /// Jumlah belum dibaca yang ditampilkan: angka badge Outlook bila ada, kalau tidak hasil baca halaman.
+    fn shown_unread(&self) -> Option<i64> {
+        self.badge_unread.or(self.unread)
+    }
+
+    fn alert_recent(&self) -> bool {
+        self.last_alert.is_some_and(|t| t.elapsed() < HOOK_SUPPRESS)
+    }
+
+    fn sound_recent(&self) -> bool {
+        self.last_sound.is_some_and(|t| t.elapsed() < Duration::from_secs(10))
+    }
+
+    /// Toast "email baru" dari kenaikan angka (badge atau halaman).
+    fn alert_count_increase(&mut self, new: i64, total: i64) {
+        if self.alert_recent() || self.user_looking() {
+            return;
+        }
+        self.pending_sound = None;
+        self.last_alert = Some(Instant::now());
+        let title = if new == 1 {
+            "1 email baru".to_string()
+        } else {
+            format!("{new} email baru")
+        };
+        // Outlook sudah membunyikan suaranya sendiri: jangan dobel.
+        let sound = (!self.sound_recent()).then_some(self.settings.sound);
+        self.toast(
+            &title,
+            &format!("Total {total} belum dibaca. Klik untuk membuka."),
+            None,
+            Some(sound.unwrap_or(false)),
+        );
+    }
+
+    fn on_badge(&mut self, count: i64) {
+        let prev = self.badge_unread;
+        self.badge_unread = Some(count);
+        self.login_seen_at = None;
+        if let Some(p) = prev {
+            if count > p {
+                self.alert_count_increase(count - p, count);
+            }
+        }
+        self.refresh_tray();
+    }
+
+    fn on_sound(&mut self) {
+        self.last_sound = Some(Instant::now());
+        if self.alert_recent() || self.user_looking() {
+            return;
+        }
+        // Tunggu sebentar: badge/notifikasi Outlook biasanya menyusul dengan info lebih lengkap.
+        self.pending_sound = Some(Instant::now());
+        self.next_tick = self.next_tick.min(Instant::now() + SOUND_WAIT);
+    }
+
+    fn flush_pending_sound(&mut self) {
+        let Some(t) = self.pending_sound else { return };
+        if t.elapsed() < SOUND_WAIT {
+            self.next_tick = self.next_tick.min(t + SOUND_WAIT);
+            return;
+        }
+        self.pending_sound = None;
+        if self.alert_recent() || self.user_looking() {
+            return;
+        }
+        self.last_alert = Some(Instant::now());
+        self.toast(
+            "Outlook",
+            "Ada email baru atau pengingat rapat. Klik untuk membuka.",
+            None,
+            Some(false), // suara sudah dibunyikan Outlook
+        );
     }
 
     fn report_manual(&self, n: i64) {
@@ -1081,26 +1216,17 @@ impl App {
         if unread >= 0 {
             let prev = self.unread;
             self.unread = Some(unread);
-            if let Some(p) = prev {
-                let hook_recent = self.last_hook.is_some_and(|t| t.elapsed() < HOOK_SUPPRESS);
-                if unread > p && !hook_recent && !self.user_looking() {
-                    let new = unread - p;
-                    let title = if new == 1 {
-                        "1 email baru".to_string()
-                    } else {
-                        format!("{new} email baru")
-                    };
-                    self.toast(
-                        &title,
-                        &format!("Total {unread} belum dibaca. Klik untuk membuka."),
-                        None,
-                        None,
-                    );
+            // Bila Outlook memberi angka badge, itu yang dipakai untuk peringatan.
+            if self.badge_unread.is_none() {
+                if let Some(p) = prev {
+                    if unread > p {
+                        self.alert_count_increase(unread - p, unread);
+                    }
                 }
             }
             if self.manual_check {
                 self.manual_check = false;
-                self.report_manual(unread);
+                self.report_manual(self.shown_unread().unwrap_or(unread));
             }
             if self.bg_deadline.is_some() && !self.inspect_pending {
                 self.finish_bg_check();
@@ -1110,10 +1236,12 @@ impl App {
     }
 
     fn on_notify(&mut self, id: u64, title: String, body: String) {
-        self.last_hook = Some(Instant::now());
         if self.user_looking() {
             return;
         }
+        self.pending_sound = None;
+        self.last_alert = Some(Instant::now());
+        let sound = !self.sound_recent() && self.settings.sound;
         let (t, b) = if self.settings.show_details {
             (
                 if title.is_empty() { "Outlook".to_string() } else { title },
@@ -1125,17 +1253,22 @@ impl App {
                 "Ada email baru atau pengingat rapat. Klik untuk membuka.".to_string(),
             )
         };
-        self.toast(&t, &b, Some(id), None);
+        self.toast(&t, &b, Some(id), Some(sound));
     }
 
     fn on_page_loaded(&mut self, url: String) {
+        let hidden = self.inst.as_ref().is_some_and(|i| !i.visible);
+        let host = urlutil::host_of(&url).unwrap_or_else(|| "?".into());
+        self.log(&format!(
+            "halaman dimuat: {host}{}",
+            if hidden { " (tersembunyi)" } else { "" }
+        ));
         if is_outlook_url(&url) {
             self.login_seen_at = None; // status login dibersihkan saat pemantau melapor
             return;
         }
         // Di jendela terlihat, halaman lain bisa saja pintasan (To Do, intranet).
         // Di instance tersembunyi kita hanya memuat Outlook, jadi halaman lain = login/redirect.
-        let hidden = self.inst.as_ref().is_some_and(|i| !i.visible);
         if hidden && self.login_seen_at.is_none() {
             self.login_seen_at = Some(Instant::now());
         }
@@ -1148,8 +1281,13 @@ impl App {
             return;
         }
         self.needs_login = true;
-        if !self.login_toasted {
+        self.log("halaman login bertahan; notifikasi berhenti sampai login");
+        let cooled = self
+            .last_login_toast
+            .is_none_or(|t| t.elapsed() >= LOGIN_TOAST_COOLDOWN);
+        if !self.login_toasted && cooled {
             self.login_toasted = true;
+            self.last_login_toast = Some(Instant::now());
             self.toast(
                 "Outlook Lite perlu login ulang",
                 "Notifikasi berhenti sampai Anda login. Klik untuk membuka.",
@@ -1194,6 +1332,7 @@ impl App {
         }
         self.inspect_pending = true;
         self.inspect_sent = false;
+        self.wake_page();
         if let Some(inst) = &self.inst {
             let _ = inst.webview.evaluate_script(INSPECT_JS);
             self.inspect_sent = true;
@@ -1328,6 +1467,7 @@ impl App {
         }
 
         self.check_login_stuck();
+        self.flush_pending_sound();
 
         // Batas waktu cek/diagnostik tersembunyi.
         if self.bg_deadline.is_some_and(|d| now >= d) {
@@ -1614,6 +1754,8 @@ impl App {
                 UserEvent::Page(PageMsg::Notify { id, title, body }) => {
                     self.on_notify(id, title, body)
                 }
+                UserEvent::Page(PageMsg::Badge(n)) => self.on_badge(n),
+                UserEvent::Page(PageMsg::Sound) => self.on_sound(),
                 UserEvent::Page(PageMsg::Inspect(data)) => self.on_inspect(data),
                 UserEvent::PageLoaded(url) => self.on_page_loaded(url),
                 UserEvent::ToastClick(id) => {
@@ -1711,7 +1853,7 @@ fn main() {
     win::init_identity(icon_png.as_deref());
     win::refresh_registrations(&exe);
 
-    let mut browser_args = format!("{WRY_DEFAULT_ARGS} {BG_ARGS}");
+    let mut browser_args = format!("{WRY_DEFAULT_ARGS} {AUTOPLAY_ARGS} {BG_ARGS}");
     if settings.no_gpu {
         browser_args.push_str(" --disable-gpu");
     }
@@ -1737,7 +1879,12 @@ fn main() {
         unfocused_since: None,
         composing: false,
         unread: None,
-        last_hook: None,
+        badge_unread: None,
+        last_alert: None,
+        last_sound: None,
+        pending_sound: None,
+        last_login_toast: None,
+        overlay_on: false,
         needs_login: false,
         login_toasted: false,
         login_seen_at: None,

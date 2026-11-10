@@ -74,6 +74,8 @@ pub struct Settings {
     pub hotkeys: bool,
     pub hotkey_toggle: String,
     pub hotkey_compose: String,
+    /// Kombinasi hotkey gagal yang sudah diberitahukan (agar toast tidak berulang).
+    pub hotkey_warned: String,
     pub auto_update: bool,
     pub diagnostics: bool,
     /// Matikan akselerasi GPU (berlaku setelah restart).
@@ -114,6 +116,7 @@ impl Default for Settings {
             hotkeys: true,
             hotkey_toggle: "Ctrl+Alt+O".into(),
             hotkey_compose: "Ctrl+Alt+N".into(),
+            hotkey_warned: String::new(),
             auto_update: true,
             diagnostics: false,
             no_gpu: false,

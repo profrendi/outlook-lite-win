@@ -37,6 +37,7 @@ pub fn is_microsoft_url(url: &str) -> bool {
             &[
                 "office.com",
                 "office365.com",
+                "cloud.microsoft",
                 "microsoft.com",
                 "microsoftonline.com",
                 "live.com",
@@ -50,6 +51,7 @@ pub fn is_microsoft_url(url: &str) -> bool {
 }
 
 /// Halaman Outlook web itu sendiri (tempat skrip pemantau aktif).
+/// Sejak akhir 2025 akun kantor dialihkan ke outlook.cloud.microsoft.
 pub fn is_outlook_url(url: &str) -> bool {
     if !url.starts_with("https://") {
         return false;
@@ -57,7 +59,10 @@ pub fn is_outlook_url(url: &str) -> bool {
     host_of(url).is_some_and(|h| {
         matches!(
             h.as_str(),
-            "outlook.office.com" | "outlook.office365.com" | "outlook.live.com"
+            "outlook.cloud.microsoft"
+                | "outlook.office.com"
+                | "outlook.office365.com"
+                | "outlook.live.com"
         )
     })
 }
@@ -167,6 +172,9 @@ mod tests {
         assert!(!is_microsoft_url("https://outlook.office.com@evil.com/"));
         assert!(!is_microsoft_url("http://outlook.office.com/"));
         assert!(is_outlook_url("https://outlook.office.com/mail/inbox"));
+        assert!(is_outlook_url("https://outlook.cloud.microsoft/mail/"));
+        assert!(!is_outlook_url("https://outlook.cloud.microsoft.evil.com/"));
+        assert!(is_microsoft_url("https://m365.cloud.microsoft/"));
         assert!(!is_outlook_url("https://login.microsoftonline.com/"));
     }
 

@@ -25,11 +25,15 @@ Butuh WebView2 Runtime (sudah ada di Windows 11 dan di PC yang memakai Edge).
 **Hanya jam kerja** (bawaan 08:00–17:00, Senin–Jumat): di luar jam itu aplikasi otomatis
 berperilaku seperti mode Mati.
 
-Notifikasi berasal dari dua sumber:
+Notifikasi berasal dari beberapa sinyal yang dipancarkan Outlook web sendiri:
 - **Notifikasi bawaan Outlook web** (email baru, pengingat rapat) diteruskan menjadi toast
   Windows. Pastikan di Outlook web: *Pengaturan > Umum > Pemberitahuan* → pemberitahuan
   desktop aktif.
-- **Jumlah belum dibaca di Inbox**, sebagai cadangan dan untuk lencana merah di ikon tray.
+- **Suara email masuk** Outlook (sama seperti PWA) dan **angka badge** (sumber tanda merah
+  di taskbar). Suara Outlook ikut berbunyi; toast dari sinyal ini tidak menambah suara kedua.
+- **Jumlah belum dibaca di Inbox**, sebagai cadangan.
+
+Tanda merah juga muncul di ikon taskbar selama jendela terbuka atau diminimalkan.
 
 Gunakan **Tes notifikasi** setelah instal. Jika toast tidak muncul, centang
 *Mode kompatibel*: toast dikirim memakai identitas PowerShell (tampil sebagai

@@ -7,7 +7,7 @@
   'use strict';
   if (window.__olite) return;
   const host = location.hostname.toLowerCase();
-  if (!/^outlook\.(office|office365|live)\.com$/.test(host)) return;
+  if (!/^outlook\.(office|office365|live)\.com$|^outlook\.cloud\.microsoft$/.test(host)) return;
   window.__olite = true;
 
   const cfg = window.__oliteCfg || {};
@@ -97,6 +97,48 @@
       ServiceWorkerRegistration.prototype.showNotification = function (title, options) {
         new OLNotification(title, options);
         return Promise.resolve();
+      };
+    }
+  } catch (e) {}
+
+  // ---------- Badge API (sumber tanda merah di taskbar pada PWA) ----------
+  try {
+    const sendBadge = (n) => {
+      const c = Number(n);
+      post({ t: 'badge', count: Number.isFinite(c) && c >= 0 ? Math.floor(c) : 0 });
+      return Promise.resolve();
+    };
+    navigator.setAppBadge = (n) => sendBadge(n === undefined ? 1 : n);
+    navigator.clearAppBadge = () => sendBadge(0);
+  } catch (e) {}
+
+  // ---------- Suara Outlook (email masuk / pengingat) ----------
+  let lastSound = 0;
+  const onSound = (src) => {
+    const now = Date.now();
+    if (now - lastSound < 1500) return; // satu suara bisa memicu beberapa panggilan
+    lastSound = now;
+    post({ t: 'sound', src: String(src || '').split('?')[0].slice(-80) });
+  };
+  try {
+    const origPlay = HTMLMediaElement.prototype.play;
+    HTMLMediaElement.prototype.play = function () {
+      try {
+        const isAudio = this instanceof HTMLAudioElement || !this.videoWidth;
+        if (isAudio && !this.muted && this.volume > 0) onSound(this.currentSrc || this.src);
+      } catch (e) {}
+      return origPlay.apply(this, arguments);
+    };
+  } catch (e) {}
+  try {
+    if (window.AudioBufferSourceNode) {
+      const origStart = AudioBufferSourceNode.prototype.start;
+      AudioBufferSourceNode.prototype.start = function () {
+        try {
+          // abaikan "buka kunci audio" (buffer sangat pendek/kosong)
+          if (this.buffer && this.buffer.duration > 0.15) onSound('webaudio');
+        } catch (e) {}
+        return origStart.apply(this, arguments);
       };
     }
   } catch (e) {}
