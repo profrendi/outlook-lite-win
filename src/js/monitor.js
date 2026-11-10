@@ -180,14 +180,18 @@
     const label = (it.getAttribute('aria-label') || it.getAttribute('title') || '').trim();
     const texts = leaves(it);
     const name = texts.find((t) => !/^\d+$/.test(t)) || (it.textContent || '').trim();
-    if (!INBOX.test(name) && !INBOX.test(label)) return null;
+    // data-folder-name="inbox" tidak tergantung bahasa tampilan Outlook.
+    const isInbox = (it.getAttribute('data-folder-name') || '').toLowerCase() === 'inbox';
+    if (!isInbox && !INBOX.test(name) && !INBOX.test(label)) return null;
     // "Inbox, 5 unread", "Kotak Masuk 5 item belum dibaca", "Inbox unread 5"
     let m = label.match(/(\d+)\s*(?:items?\s*|item\s*)?(?:unread|belum)/i)
       || label.match(/(?:unread|belum dibaca)\D{0,12}(\d+)/i);
     if (m) return { n: +m[1], how: 'label' };
     const nums = texts.filter((t) => /^\d{1,6}$/.test(t));
     if (nums.length) return { n: +nums[0], how: 'angka' };
-    m = label.replace(INBOX, '').match(/(\d{1,6})/);
+    // Abaikan jumlah total ("1,172 items", "50 item") supaya tidak terbaca sebagai belum dibaca.
+    m = label.replace(INBOX, '').replace(/\d[\d.,]*\s*(items?|elemen|elemente)\b/gi, '')
+      .match(/(\d{1,6})/);
     if (m) return { n: +m[1], how: 'label-angka' };
     return { n: 0, how: 'tanpa-angka' }; // Outlook tidak menampilkan angka bila 0
   }
