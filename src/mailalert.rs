@@ -167,10 +167,6 @@ impl Tracker {
         alert
     }
 
-    /// Buang batch tanpa menampilkan (mis. pengguna sedang melihat jendela).
-    pub fn discard(&mut self) {
-        self.batch = None;
-    }
 }
 
 fn evaluate(b: &Batch) -> Option<Alert> {

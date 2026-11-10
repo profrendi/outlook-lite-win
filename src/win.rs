@@ -11,6 +11,7 @@ const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 pub type Callback = Arc<dyn Fn() + Send + Sync>;
 
 /// Memori proses aplikasi + semua proses WebView2 turunannya.
+#[allow(dead_code)] // working/count untuk diagnostik di masa depan
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TreeMem {
     /// Private working set (kolom Memory di Task Manager), byte.
