@@ -199,6 +199,10 @@ Aplikasi: `%LOCALAPPDATA%\Programs\OutlookLite\outlook-lite.exe`. Data: `%LOCALA
 - Di luar jam kerja (bila *Hanya jam kerja* aktif) tidak ada notifikasi.
 - Saat Outlook tersembunyi disegarkan, notifikasi berhenti beberapa detik selama halaman dimuat.
 - Bila sesi login kedaluwarsa, notifikasi berhenti sampai Anda login lagi (ikon kuning + toast).
+- Bila Outlook dibuka sebelum ada internet (mis. sebelum Wi-Fi/VPN kantor tersambung), aplikasi
+  menunggu koneksi lalu memuat ulang sendiri; bila masih gagal, WebView2 dibuat ulang dari awal
+  (sama seperti Keluar lalu buka lagi). Tidak perlu Keluar manual. Status tray menampilkan
+  *"tidak terhubung, mencoba lagi otomatis"* selama menunggu.
 - Toast yang sudah masuk Pusat Notifikasi mungkin tidak membuka jendela saat diklik.
 
 ## Build dan rilis

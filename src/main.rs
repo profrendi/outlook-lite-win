@@ -16,6 +16,7 @@ mod diag;
 mod icon;
 mod install;
 mod mailalert;
+mod netrecover;
 mod settings;
 mod update;
 mod urlutil;
@@ -122,6 +123,8 @@ enum UserEvent {
     Update(update::Outcome, bool),
     /// Proses WebView2 mati/macet (jenis kegagalan WebView2).
     ProcessFailed(i32),
+    /// Navigasi halaman utama selesai (berhasil, status error WebView2).
+    NavDone(bool, i32),
 }
 
 enum RemoteCmd {
@@ -698,6 +701,9 @@ struct App {
     next_trim_check: Option<Instant>,
     last_trim: Option<Instant>,
     background_mode: bool,
+    net: netrecover::NetRecovery,
+    /// WebView2 dibuat ulang pada waktu ini (jendela terlihat?), setelah proses lama selesai.
+    recreate_at: Option<(Instant, bool)>,
 
     update_running: bool,
     last_update_check: Option<Instant>,
@@ -760,7 +766,9 @@ impl App {
             Mode::Siaga => "Siaga".into(),
             Mode::Jeda => "Jeda (di luar jam kerja)".into(),
         });
-        if self.needs_login {
+        if self.net.failing() {
+            parts.push("tidak terhubung, mencoba lagi otomatis".into());
+        } else if self.needs_login {
             parts.push("perlu login".into());
         } else if let Some(n) = self.shown_unread() {
             parts.push(if n > 0 {
@@ -1126,6 +1134,10 @@ impl App {
             win::on_process_failed(&webview, move |k| {
                 let _ = p.send_event(UserEvent::ProcessFailed(k));
             });
+            let p = self.proxy.clone();
+            win::on_navigation_completed(&webview, move |ok, status| {
+                let _ = p.send_event(UserEvent::NavDone(ok, status));
+            });
         }
         if !visible {
             // Beri tahu WebView2 bahwa halaman tidak terlihat supaya ia berhemat
@@ -1177,6 +1189,7 @@ impl App {
 
     fn show(&mut self, target: &EventLoopWindowTarget<UserEvent>, url: Option<&str>) {
         self.bg_deadline = None;
+        self.net.poke(Instant::now());
         // Outlook tersembunyi bertampilan mobile tidak dipakai untuk jendela: buat versi desktop.
         if self.inst.as_ref().is_some_and(|i| i.mobile) {
             self.destroy_instance();
@@ -1407,6 +1420,91 @@ impl App {
                 self.settle_until = Some(Instant::now() + REFRESH_SETTLE);
             }
             _ => {}
+        }
+    }
+
+    fn on_nav_done(&mut self, ok: bool, status: i32) {
+        let now = Instant::now();
+        if ok {
+            if let Some((dur, n)) = self.net.on_success(now) {
+                let msg = format!(
+                    "koneksi pulih setelah {} detik ({n} percobaan otomatis)",
+                    dur.as_secs()
+                );
+                self.log(&msg);
+                self.diag_note(&msg);
+                self.refresh_tray();
+            }
+            return;
+        }
+        if !netrecover::is_network_error(status) {
+            return;
+        }
+        if !self.net.failing() {
+            let msg = format!(
+                "Outlook gagal dimuat: tidak ada koneksi (status {status}, Windows: {})",
+                if win::is_online() { "online" } else { "offline" }
+            );
+            self.log(&msg);
+            self.diag_note(&msg);
+        }
+        self.net.on_failure(now);
+        self.refresh_tray();
+        if let Some(t) = self.net.next_at() {
+            self.next_tick = self.next_tick.min(t);
+        }
+    }
+
+    /// Pemulihan koneksi otomatis (dari tick). Lihat netrecover.rs.
+    fn net_tick(&mut self, target: &EventLoopWindowTarget<UserEvent>, now: Instant) {
+        if let Some((t, visible)) = self.recreate_at {
+            if now >= t {
+                self.recreate_at = None;
+                if visible {
+                    self.show(target, None);
+                } else if self.active_mode() == Mode::Siaga {
+                    self.create_instance(target, MAIL_URL, false);
+                }
+            } else {
+                self.next_tick = self.next_tick.min(t);
+            }
+        }
+        if !self.net.failing() {
+            return;
+        }
+        if self.net.next_at().is_some_and(|t| now >= t) {
+            let online = win::is_online();
+            match self.net.tick(now, online) {
+                netrecover::Action::None => {}
+                netrecover::Action::Reload => {
+                    self.log("koneksi: memuat ulang Outlook");
+                    self.diag_note("koneksi: muat ulang");
+                    if let Some(inst) = &self.inst {
+                        let _ = inst.webview.load_url(MAIL_URL);
+                    }
+                    self.settle_until = Some(now + REFRESH_SETTLE);
+                }
+                netrecover::Action::Recreate => {
+                    // Sama seperti Keluar lalu membuka lagi: proses WebView2 baru, sehingga
+                    // jaringan/proxy dibaca ulang dari awal.
+                    let visible = self
+                        .inst
+                        .as_ref()
+                        .is_some_and(|i| i.visible && !i.minimized);
+                    self.log(&format!(
+                        "koneksi: membuat ulang WebView2 (percobaan {})",
+                        self.net.attempts()
+                    ));
+                    self.diag_note("koneksi: buat ulang WebView2");
+                    self.destroy_instance();
+                    // Beri waktu proses WebView2 lama berhenti agar yang baru benar-benar baru.
+                    self.recreate_at = Some((now + Duration::from_secs(4), visible));
+                    self.settle_until = Some(now + REFRESH_SETTLE);
+                }
+            }
+        }
+        if let Some(t) = self.net.next_at() {
+            self.next_tick = self.next_tick.min(t);
         }
     }
 
@@ -2079,7 +2177,7 @@ impl App {
             let can_retry = self
                 .create_failed_at
                 .is_none_or(|t| t.elapsed() >= CREATE_RETRY);
-            if self.inst.is_none() && can_retry {
+            if self.inst.is_none() && can_retry && self.recreate_at.is_none() {
                 self.create_instance(target, MAIL_URL, false);
             }
         }
@@ -2094,6 +2192,7 @@ impl App {
             }
         }
         self.flush_mail_alert();
+        self.net_tick(target, now);
         self.manage_memory(now);
 
         // Batas waktu cek/diagnostik tersembunyi.
@@ -2413,6 +2512,7 @@ impl App {
                     self.quit("diminta instance lain (instal/update/hapus instalasi)")
                 }
                 UserEvent::ProcessFailed(kind) => self.on_process_failed(kind),
+                UserEvent::NavDone(ok, status) => self.on_nav_done(ok, status),
                 UserEvent::Page(PageMsg::State {
                     unread,
                     composing,
@@ -2651,6 +2751,8 @@ fn main() {
         next_trim_check: None,
         last_trim: None,
         background_mode: false,
+        net: netrecover::NetRecovery::default(),
+        recreate_at: None,
         update_running: false,
         last_update_check: None,
         update_ready: None,

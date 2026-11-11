@@ -521,6 +521,43 @@ mod imp {
         }
     }
 
+    /// Panggil `cb(berhasil, status_error)` setiap navigasi halaman utama selesai.
+    pub fn on_navigation_completed(webview: &wry::WebView, cb: impl Fn(bool, i32) + 'static) {
+        use webview2_com::{
+            Microsoft::Web::WebView2::Win32::COREWEBVIEW2_WEB_ERROR_STATUS,
+            NavigationCompletedEventHandler,
+        };
+        use wry::WebViewExtWindows;
+        let handler = NavigationCompletedEventHandler::create(Box::new(move |_wv, args| {
+            if let Some(a) = args {
+                let mut ok = windows::core::BOOL(0);
+                let mut status = COREWEBVIEW2_WEB_ERROR_STATUS(0);
+                unsafe {
+                    let _ = a.IsSuccess(&mut ok);
+                    let _ = a.WebErrorStatus(&mut status);
+                }
+                cb(ok.as_bool(), status.0);
+            }
+            Ok(())
+        }));
+        let mut token = 0i64;
+        unsafe {
+            let _ = webview.webview().add_NavigationCompleted(&handler, &mut token);
+        }
+    }
+
+    /// Apakah Windows melaporkan ada koneksi internet. Bila tidak bisa ditanyakan, dianggap ada.
+    pub fn is_online() -> bool {
+        use windows::Win32::Networking::NetworkListManager::{INetworkListManager, NetworkListManager};
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+        unsafe {
+            CoCreateInstance::<_, INetworkListManager>(&NetworkListManager, None, CLSCTX_ALL)
+                .and_then(|m| m.IsConnectedToInternet())
+                .map(|v| v.0 != 0)
+                .unwrap_or(true)
+        }
+    }
+
     /// Panggil `cb` dengan jenis kegagalan bila proses WebView2 mati/macet
     /// (0 = browser, 1 = renderer halaman keluar, 2 = renderer tidak merespons, 6 = GPU, ...).
     pub fn on_process_failed(webview: &wry::WebView, cb: impl Fn(i32) + 'static) {
@@ -681,6 +718,10 @@ mod imp {
         String::new()
     }
     pub fn on_process_failed(_webview: &wry::WebView, _cb: impl Fn(i32) + 'static) {}
+    pub fn on_navigation_completed(_webview: &wry::WebView, _cb: impl Fn(bool, i32) + 'static) {}
+    pub fn is_online() -> bool {
+        true
+    }
     pub fn set_background_mode(_background: bool) -> u32 {
         0
     }
