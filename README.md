@@ -99,7 +99,8 @@ Ikon tray: **titik merah** = ada email belum dibaca, **titik kuning** = perlu lo
 
 | Keadaan | Yang dilakukan |
 |---|---|
-| Selalu | Tanpa GPU, tanpa service worker Outlook, V8 hemat memori, mode perangkat RAM kecil Chromium, tanpa proses renderer cadangan, tanpa cache halaman sebelumnya, tanpa layanan jaringan latar, iframe Microsoft berbagi proses dengan Outlook, telemetri Outlook/Office diblokir, autofill & simpan kata sandi WebView2 mati |
+| Selalu | Tanpa GPU, tanpa service worker Outlook, V8 hemat memori, mode perangkat RAM kecil Chromium, tanpa proses renderer cadangan, tanpa cache halaman sebelumnya, tanpa layanan jaringan latar, iframe Microsoft berbagi proses dengan Outlook, telemetri Outlook/Office diblokir, autofill & simpan kata sandi WebView2 mati, tracking prevention mati, SmartScreen mati (API resmi), izin kamera/mikrofon/lokasi/sensor ditolak otomatis |
+| Tersembunyi | WebView2 sendiri menganggap halaman sedang kekurangan memori dan membersihkan cache & memori JavaScript |
 | Dipakai, tapi tidak difokus > 1 menit | WebView2 diminta memakai memori rendah; normal lagi saat jendela difokus |
 | Diminimalkan / di tray | Tampilan WebView2 dimatikan; **mode efisiensi** Windows (daun hijau di Task Manager), prioritas CPU dan memori rendah; RAM dicek tiap 30 detik dan dirapikan otomatis bila melewati 40 MB (paling sering tiap 60 detik, paling lambat tiap 5 menit), sekaligus memicu WebView2 membersihkan memori JavaScript; panel folder dibaca tiap 9 detik (email masuk tetap terdeteksi seketika) |
 | Dibuka lagi | Prioritas dan memori langsung kembali normal |
@@ -122,6 +123,17 @@ Outlook tersembunyi dimuat dengan tampilan HP yang mungkin lebih ringan. Membuka
 beberapa detik lebih lama (dimuat ulang versi desktop), dan jumlah belum dibaca di tray memakai
 badge Outlook. Bandingkan hasilnya lewat laporan diagnostik.
 
+## Privasi
+
+- Telemetri halaman Outlook web/Office diblokir di dalam WebView2.
+- SmartScreen WebView2 (cek reputasi alamat ke Microsoft) dimatikan.
+- Laporan crash WebView2 disimpan lokal (`%LOCALAPPDATA%\OutlookLite\WebView2`), tidak dikirim ke Microsoft.
+- Tracking prevention dimatikan: daftar pelacak tidak diunduh/dicek (aman karena hanya memuat Outlook).
+- Tidak bisa dimatikan oleh aplikasi: data diagnostik **wajib** WebView2 (kinerja & keandalan)
+  dan data opsional yang diatur Windows (*Settings > Privacy & security > Diagnostics & feedback*).
+- Bisa Anda matikan sendiri: Outlook web *Settings > General > Privacy and data > Privacy settings*
+  (optional connected experiences).
+
 ## Laporan diagnostik (RAM & CPU)
 
 1. Tray > Pengaturan > centang **Catat diagnostik (RAM & CPU tiap 30 detik)**.
@@ -134,7 +146,9 @@ keadaan (dipakai, tak-fokus, minimize, tray, jeda), 300 baris log terakhir, dan 
 per 30 detik: RAM & CPU per jenis proses (aplikasi, WebView2 Manager, renderer Outlook,
 renderer lain, GPU, utility), jumlah belum dibaca, dan kejadian (pindah keadaan, rapikan
 memori sebelum/sesudah, segarkan, toast, perlu login, sumber angka belum dibaca, proses
-WebView2 yang mati/macet). Log juga mencatat setiap aplikasi mulai dan keluar beserta
+WebView2 yang mati/macet, waktu buka jendela dari tray/minimize sampai halaman merespons,
+page fault per menit), serta daftar domain yang dihubungi WebView2 beserta jumlah permintaan
+dimuat/diblokir (hanya nama domain). Log juga mencatat setiap aplikasi mulai dan keluar beserta
 alasannya, sesi yang berhenti tidak normal, dan lokasi error bila aplikasi crash. Tidak berisi
 pengirim, subjek, atau isi email. Data mentah juga ada di `diagnostik.csv`.
 
@@ -162,6 +176,11 @@ Di `%LOCALAPPDATA%\OutlookLite\settings.json`. Setelah diubah manual, pilih
   "efficiency_mode": true,
   "block_telemetry": true,
   "low_end_mode": true,
+  "custom_environment": true,
+  "tracking_prevention": false,
+  "local_crash_reports": true,
+  "simulate_memory_pressure": true,
+  "system_proxy_resolver": true,
   "refresh_hours": 8,
   "tray_mobile_ui": false,
   "site_isolation": false,
@@ -173,8 +192,10 @@ Di `%LOCALAPPDATA%\OutlookLite\settings.json`. Setelah diubah manual, pilih
 
 `refresh_mb` / `refresh_ws_mb` / `refresh_hours` = 0 mematikan penyegaran otomatis. `trim_ws_mb` = 0
 hanya merapikan berkala. `low_end_mode` bisa membuat gulir terlihat sedikit kurang halus; set `false`
-bila mengganggu. `site_isolation`, `no_gpu`, `low_end_mode`, `v8_optimize_for_size`, dan
-`extra_browser_args` berlaku setelah aplikasi di-restart.
+bila mengganggu. `custom_environment` = false kembali ke cara lama membuat WebView2 (bila ada
+masalah). `site_isolation`, `no_gpu`, `low_end_mode`, `v8_optimize_for_size`, `custom_environment`,
+`tracking_prevention`, `local_crash_reports`, `simulate_memory_pressure`, `system_proxy_resolver`,
+dan `extra_browser_args` berlaku setelah aplikasi di-restart.
 
 ## Diagnostik halaman (jika jumlah belum dibaca tidak terbaca)
 

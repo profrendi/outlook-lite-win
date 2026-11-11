@@ -61,6 +61,16 @@ pub struct Settings {
     pub block_telemetry: bool,
     /// Mode perangkat RAM kecil Chromium (berlaku setelah restart).
     pub low_end_mode: bool,
+    /// Buat environment WebView2 sendiri (opsi resmi di bawah). Bila gagal, otomatis cara lama.
+    pub custom_environment: bool,
+    /// Tracking prevention WebView2 (daftar pelacak). Mati = lebih ringan; aman karena hanya Outlook.
+    pub tracking_prevention: bool,
+    /// Laporan crash WebView2 disimpan lokal, tidak dikirim ke Microsoft.
+    pub local_crash_reports: bool,
+    /// Flag WebView2: WebView tersembunyi diperlakukan seperti kekurangan memori (bersih-bersih sendiri).
+    pub simulate_memory_pressure: bool,
+    /// Proxy dibaca lewat Windows (WinHTTP). Membantu jaringan kantor saat PC baru menyala.
+    pub system_proxy_resolver: bool,
     /// Segarkan Outlook tersembunyi bila RAM nyata (working set) naik lagi melebihi ini, MB. 0 = tidak.
     pub refresh_ws_mb: u32,
     /// Eksperimen: Outlook tersembunyi di tray memakai tampilan mobile (mungkin lebih ringan).
@@ -113,6 +123,11 @@ impl Default for Settings {
             efficiency_mode: true,
             block_telemetry: true,
             low_end_mode: true,
+            custom_environment: true,
+            tracking_prevention: false,
+            local_crash_reports: true,
+            simulate_memory_pressure: true,
+            system_proxy_resolver: true,
             tray_mobile_ui: false,
             refresh_hours: 8,
             zoom: 1.0,

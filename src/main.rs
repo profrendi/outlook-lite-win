@@ -359,9 +359,26 @@ fn mobile_user_agent() -> String {
     )
 }
 
-fn browser_args_for(s: &Settings) -> String {
+fn browser_args_for(s: &Settings, started_in_tray: bool) -> String {
     let mut features = DISABLED_FEATURES.to_string();
     let mut extra = String::new();
+    let mut enable: Vec<&str> = Vec::new();
+    if s.simulate_memory_pressure {
+        // Flag WebView2: WebView yang tidak aktif (tersembunyi) diperlakukan seperti sedang
+        // kekurangan memori, sehingga mesinnya sendiri membuang cache & menjalankan GC.
+        enable.push("msWebView2SimulateMemoryPressureWhenInactive");
+    }
+    if !enable.is_empty() {
+        extra.push_str(&format!(" --enable-features={}", enable.join(",")));
+    }
+    if s.system_proxy_resolver {
+        // Proxy kantor dibaca lewat Windows (WinHTTP), sama seperti aplikasi Windows lain.
+        extra.push_str(" --use-system-proxy-resolver");
+    }
+    if started_in_tray {
+        // Dimulai langsung di tray (mulai dengan Windows): WebView2 diluncurkan sebagai latar.
+        extra.push_str(" --edge-webview-is-background");
+    }
     if !s.site_isolation {
         features.push(',');
         features.push_str(NO_SITE_ISOLATION);
@@ -702,6 +719,9 @@ struct App {
     last_trim: Option<Instant>,
     background_mode: bool,
     net: netrecover::NetRecovery,
+    env_logged: bool,
+    /// Jendela dibuka dari tray/minimize: kapan, dan dari mana (untuk mengukur waktu buka).
+    restore_started: Option<(Instant, &'static str)>,
     /// WebView2 dibuat ulang pada waktu ini (jendela terlihat?), setelah proses lama selesai.
     recreate_at: Option<(Instant, bool)>,
 
@@ -1064,6 +1084,34 @@ impl App {
         let low = self.settings.low_memory;
         #[cfg(windows)]
         let args = self.browser_args.clone();
+        // Environment WebView2 sendiri (dibuat sebelum builder meminjam web_context).
+        #[cfg(windows)]
+        let custom_env = if self.settings.custom_environment {
+            match win::create_environment(
+                &self.dir.join("WebView2"),
+                &args,
+                self.settings.tracking_prevention,
+                self.settings.local_crash_reports,
+            ) {
+                Ok(env) => Some(env),
+                Err(e) => {
+                    // Cadangan: cara lama (environment dibuat wry). Outlook tetap jalan.
+                    self.log(&format!("environment WebView2 sendiri gagal, pakai cara lama: {e}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(windows)]
+        if !self.env_logged {
+            self.env_logged = true;
+            self.log(if custom_env.is_some() {
+                "WebView2: environment sendiri (tracking prevention mati, crash disimpan lokal)"
+            } else {
+                "WebView2: environment bawaan"
+            });
+        }
         let proxy_ipc = self.proxy.clone();
         let proxy_load = self.proxy.clone();
         let mobile = !visible && self.settings.tray_mobile_ui;
@@ -1098,7 +1146,10 @@ impl App {
         #[cfg(windows)]
         let builder = {
             use wry::WebViewBuilderExtWindows;
-            builder.with_additional_browser_args(args)
+            match custom_env {
+                Some(env) => builder.with_environment(env),
+                None => builder.with_additional_browser_args(args),
+            }
         };
         let builder = if mobile {
             builder.with_user_agent(mobile_user_agent())
@@ -1198,6 +1249,10 @@ impl App {
             if let Some(u) = url {
                 let _ = inst.webview.load_url(u);
             }
+            if !inst.visible || inst.minimized || inst.window.is_minimized() {
+                let from = if inst.visible { "minimize" } else { "tray" };
+                self.restore_started = Some((Instant::now(), from));
+            }
             if !inst.visible {
                 inst.window.set_visible(true);
                 inst.visible = true;
@@ -1220,6 +1275,9 @@ impl App {
             self.trim_at = None;
             self.hidden_since = None;
             self.refresh_tray();
+            if self.restore_started.is_some() {
+                self.force_read();
+            }
         } else {
             self.create_instance(target, url.unwrap_or(MAIL_URL), true);
         }
@@ -1328,6 +1386,10 @@ impl App {
                 self.low_unfocused = false;
                 self.trim_at = None;
                 self.leave_background_mode();
+                if self.restore_started.is_none() {
+                    self.restore_started = Some((Instant::now(), "minimize"));
+                    self.force_read();
+                }
             }
             self.record_geom();
         }
@@ -1568,6 +1630,7 @@ impl App {
             &note,
         );
         diag::append_row(&self.dir, &row);
+        diag::flush_domains(&self.dir);
         self.last_row = Some(row);
     }
 
@@ -1640,6 +1703,11 @@ impl App {
             );
             r.push_str(&diag::summarize(&rows));
         }
+        let _ = writeln!(r);
+
+        let _ = writeln!(r, "== Domain yang dihubungi WebView2 (jumlah permintaan) ==");
+        diag::flush_domains(&self.dir);
+        r.push_str(&diag::domains_report(&self.dir));
         let _ = writeln!(r);
 
         let _ = writeln!(r, "== Pengaturan ==");
@@ -1935,6 +2003,13 @@ impl App {
 
     fn on_state(&mut self, unread: i64, composing: bool, how: String, force: bool) {
         self.composing = composing;
+        if let Some((t, from)) = self.restore_started.take() {
+            // Waktu dari jendela dibuka sampai halaman Outlook menjawab lagi.
+            let ms = t.elapsed().as_millis();
+            let msg = format!("buka jendela dari {from}: halaman merespons {ms} ms");
+            self.log(&msg);
+            self.diag_note(&msg);
+        }
         if how != self.unread_how && !how.is_empty() {
             self.diag_note(&format!("baca Inbox: {how}"));
             self.unread_how = how;
@@ -2351,6 +2426,7 @@ impl App {
             }
             id::DIAG_RAM => {
                 self.settings.diagnostics = !self.settings.diagnostics;
+                diag::set_domains_enabled(self.settings.diagnostics);
                 self.next_sample = None;
                 self.diag_state = None;
                 self.last_row = None;
@@ -2684,7 +2760,7 @@ fn main() {
     win::init_identity(icon_png.as_deref());
     win::refresh_registrations(&exe);
 
-    let mut browser_args = browser_args_for(&settings);
+    let mut browser_args = browser_args_for(&settings, args.tray);
     if settings.no_gpu {
         browser_args.push_str(" --disable-gpu");
     }
@@ -2752,6 +2828,8 @@ fn main() {
         last_trim: None,
         background_mode: false,
         net: netrecover::NetRecovery::default(),
+        env_logged: false,
+        restore_started: None,
         recreate_at: None,
         update_running: false,
         last_update_check: None,
@@ -2759,6 +2837,7 @@ fn main() {
         initial_url,
         exiting: false,
     };
+    diag::set_domains_enabled(app.settings.diagnostics);
     if abnormal.is_some() {
         app.diag_note("sesi sebelumnya berhenti tidak normal");
     }

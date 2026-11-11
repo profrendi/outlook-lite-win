@@ -347,6 +347,7 @@ mod imp {
                         pmc.WorkingSetSize
                     } as u64;
                     p.commit = pmc.PrivateUsage as u64;
+                    p.page_faults = pmc.PageFaultCount as u64;
                 }
                 let (mut c, mut e, mut k, mut u) = (
                     FILETIME::default(),
@@ -469,6 +470,51 @@ mod imp {
         n
     }
 
+    /// Buat environment WebView2 sendiri (bukan bawaan wry) supaya bisa memakai opsi resmi
+    /// yang tidak tersedia lewat wry: tracking prevention mati (lebih ringan menurut Microsoft,
+    /// aman karena hanya memuat Outlook) dan laporan crash disimpan lokal, tidak dikirim.
+    pub fn create_environment(
+        data_dir: &std::path::Path,
+        browser_args: &str,
+        tracking_prevention: bool,
+        local_crash_reports: bool,
+    ) -> Result<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment, String> {
+        use webview2_com::{
+            CoreWebView2EnvironmentOptions, CreateCoreWebView2EnvironmentCompletedHandler,
+            Microsoft::Web::WebView2::Win32::{
+                CreateCoreWebView2EnvironmentWithOptions, ICoreWebView2EnvironmentOptions,
+            },
+        };
+        use windows::core::{HSTRING, PCWSTR};
+        let (tx, rx) = std::sync::mpsc::channel();
+        let options = CoreWebView2EnvironmentOptions::default();
+        unsafe {
+            options.set_additional_browser_arguments(browser_args.to_string());
+            options.set_are_browser_extensions_enabled(false);
+            options.set_enable_tracking_prevention(tracking_prevention);
+            options.set_is_custom_crash_reporting_enabled(local_crash_reports);
+            options.set_allow_single_sign_on_using_os_primary_account(false);
+            CreateCoreWebView2EnvironmentWithOptions(
+                PCWSTR::null(),
+                &HSTRING::from(data_dir.as_os_str()),
+                &ICoreWebView2EnvironmentOptions::from(options),
+                &CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
+                    move |error_code, environment| {
+                        let r = error_code.and_then(|_| {
+                            environment.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_POINTER))
+                        });
+                        let _ = tx.send(r);
+                        Ok(())
+                    },
+                )),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        webview2_com::wait_with_pump(rx)
+            .map_err(|e| format!("{e:?}"))?
+            .map_err(|e| e.to_string())
+    }
+
     /// Pengaturan WebView2 yang tidak dibutuhkan Outlook dimatikan (autofill formulir,
     /// simpan kata sandi), dan permintaan telemetri ke `blocked_hosts` dijawab langsung
     /// "204 No Content" tanpa keluar ke internet.
@@ -476,9 +522,17 @@ mod imp {
         use webview2_com::{
             take_pwstr,
             Microsoft::Web::WebView2::Win32::{
-                ICoreWebView2Settings4, ICoreWebView2_2, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                ICoreWebView2Settings4, ICoreWebView2Settings8, ICoreWebView2_2,
+                COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_CAMERA,
+                COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION, COREWEBVIEW2_PERMISSION_KIND_LOCAL_FONTS,
+                COREWEBVIEW2_PERMISSION_KIND_MICROPHONE,
+                COREWEBVIEW2_PERMISSION_KIND_MIDI_SYSTEM_EXCLUSIVE_MESSAGES,
+                COREWEBVIEW2_PERMISSION_KIND_OTHER_SENSORS,
+                COREWEBVIEW2_PERMISSION_KIND_WINDOW_MANAGEMENT, COREWEBVIEW2_PERMISSION_STATE_DENY,
+                COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
             },
-            WebResourceRequestedEventHandler,
+            PermissionRequestedEventHandler, WebResourceRequestedEventHandler,
+            WebResourceResponseReceivedEventHandler,
         };
         use windows::core::{w, Interface, HSTRING, PWSTR};
         use wry::WebViewExtWindows;
@@ -487,6 +541,51 @@ mod imp {
             if let Ok(st) = wv.Settings().and_then(|s| s.cast::<ICoreWebView2Settings4>()) {
                 let _ = st.SetIsGeneralAutofillEnabled(false);
                 let _ = st.SetIsPasswordAutosaveEnabled(false);
+            }
+            // SmartScreen (cek reputasi alamat ke Microsoft) dimatikan lewat API resmi.
+            if let Ok(st) = wv.Settings().and_then(|s| s.cast::<ICoreWebView2Settings8>()) {
+                let _ = st.SetIsReputationCheckingRequired(false);
+            }
+            // Izin yang tidak dipakai Outlook ditolak tanpa bertanya. Notifikasi, clipboard,
+            // autoplay suara, dan unduhan lampiran tidak disentuh.
+            let perm = PermissionRequestedEventHandler::create(Box::new(|_wv, args| {
+                let Some(a) = args else { return Ok(()) };
+                let mut kind = COREWEBVIEW2_PERMISSION_KIND::default();
+                a.PermissionKind(&mut kind)?;
+                let deny = [
+                    COREWEBVIEW2_PERMISSION_KIND_CAMERA,
+                    COREWEBVIEW2_PERMISSION_KIND_MICROPHONE,
+                    COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION,
+                    COREWEBVIEW2_PERMISSION_KIND_OTHER_SENSORS,
+                    COREWEBVIEW2_PERMISSION_KIND_MIDI_SYSTEM_EXCLUSIVE_MESSAGES,
+                    COREWEBVIEW2_PERMISSION_KIND_WINDOW_MANAGEMENT,
+                    COREWEBVIEW2_PERMISSION_KIND_LOCAL_FONTS,
+                ];
+                if deny.contains(&kind) {
+                    a.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY)?;
+                }
+                Ok(())
+            }));
+            let mut ptoken = 0i64;
+            let _ = wv.add_PermissionRequested(&perm, &mut ptoken);
+
+            // Catat domain yang dihubungi (untuk laporan diagnostik; tanpa alamat lengkap).
+            if let Ok(wv2) = wv.cast::<ICoreWebView2_2>() {
+                let rec = WebResourceResponseReceivedEventHandler::create(Box::new(|_wv, args| {
+                    if !crate::diag::domains_enabled() {
+                        return Ok(());
+                    }
+                    let Some(a) = args else { return Ok(()) };
+                    let mut uri = PWSTR::null();
+                    a.Request()?.Uri(&mut uri)?;
+                    let uri = take_pwstr(uri);
+                    if let Some(h) = crate::urlutil::host_of(&uri) {
+                        crate::diag::record_domain(&h, false);
+                    }
+                    Ok(())
+                }));
+                let mut rtoken = 0i64;
+                let _ = wv2.add_WebResourceResponseReceived(&rec, &mut rtoken);
             }
             if blocked_hosts.is_empty() {
                 return;
@@ -505,6 +604,9 @@ mod imp {
                 let host = crate::urlutil::host_of(&uri).unwrap_or_default();
                 if !crate::urlutil::host_matches_pattern(&host, blocked_hosts) {
                     return Ok(());
+                }
+                if crate::diag::domains_enabled() {
+                    crate::diag::record_domain(&host, true);
                 }
                 let env = sender.cast::<ICoreWebView2_2>()?.Environment()?;
                 let resp = env.CreateWebResourceResponse(
@@ -726,6 +828,14 @@ mod imp {
         0
     }
     pub fn tune_webview(_webview: &wry::WebView, _blocked_hosts: &'static [&'static str]) {}
+    pub fn create_environment(
+        _data_dir: &std::path::Path,
+        _browser_args: &str,
+        _tracking_prevention: bool,
+        _local_crash_reports: bool,
+    ) -> Result<(), String> {
+        Err("hanya Windows".into())
+    }
     pub fn trim_process_tree() -> u32 {
         0
     }

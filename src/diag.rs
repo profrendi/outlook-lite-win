@@ -31,6 +31,8 @@ pub struct Proc {
     pub commit: u64,
     /// Total waktu CPU (kernel + user) sejak proses mulai, satuan 100 ns.
     pub cpu_time: u64,
+    /// Total page fault sejak proses mulai (halaman memori yang harus diambil lagi).
+    pub page_faults: u64,
 }
 
 /// Keadaan aplikasi saat sampel diambil.
@@ -60,7 +62,7 @@ impl State {
 
 pub const CSV_HEADER: &str = "waktu,keadaan,proses,ram_mb,commit_mb,cpu_pct,\
 app_mb,browser_mb,renderer_utama_mb,renderer_lain_mb,gpu_mb,utility_mb,lain_mb,\
-app_cpu,browser_cpu,renderer_cpu,gpu_cpu,utility_cpu,lain_cpu,belum_dibaca,catatan";
+app_cpu,browser_cpu,renderer_cpu,gpu_cpu,utility_cpu,lain_cpu,belum_dibaca,page_fault_per_mnt,catatan";
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Row {
@@ -84,6 +86,8 @@ pub struct Row {
     pub utility_cpu: f64,
     pub other_cpu: f64,
     pub unread: Option<i64>,
+    /// Page fault per menit (semua proses). Tinggi = memori sering diambil kembali setelah dirapikan.
+    pub pf_per_min: f64,
     pub note: String,
 }
 
@@ -98,6 +102,7 @@ fn r1(x: f64) -> f64 {
 /// Menghitung CPU% dari selisih waktu CPU antar sampel.
 pub struct Sampler {
     prev: HashMap<u32, u64>,
+    prev_pf: HashMap<u32, u64>,
     prev_at: Option<Instant>,
     cpus: f64,
 }
@@ -106,6 +111,7 @@ impl Sampler {
     pub fn new(cpus: usize) -> Self {
         Self {
             prev: HashMap::new(),
+            prev_pf: HashMap::new(),
             prev_at: None,
             cpus: cpus.max(1) as f64,
         }
@@ -188,6 +194,19 @@ impl Sampler {
                 }
             }
         }
+        // Page fault per menit: hanya proses yang juga ada di sampel sebelumnya.
+        if elapsed_100ns > 0.0 {
+            let delta: u64 = procs
+                .iter()
+                .filter_map(|p| {
+                    self.prev_pf
+                        .get(&p.pid)
+                        .map(|&b| p.page_faults.saturating_sub(b))
+                })
+                .sum();
+            let minutes = elapsed_100ns / 600_000_000.0;
+            row.pf_per_min = (delta as f64 / minutes).round();
+        }
         row.ram_mb = mb(ws);
         row.commit_mb = mb(commit);
         for v in [
@@ -210,6 +229,7 @@ impl Sampler {
         }
 
         self.prev = procs.iter().map(|p| (p.pid, p.cpu_time)).collect();
+        self.prev_pf = procs.iter().map(|p| (p.pid, p.page_faults)).collect();
         self.prev_at = Some(now);
         row
     }
@@ -218,7 +238,7 @@ impl Sampler {
 impl Row {
     pub fn to_csv(&self) -> String {
         format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             self.time,
             self.state,
             self.procs,
@@ -239,6 +259,7 @@ impl Row {
             self.utility_cpu,
             self.other_cpu,
             self.unread.map(|n| n.to_string()).unwrap_or_default(),
+            self.pf_per_min,
             self.note
         )
     }
@@ -270,9 +291,95 @@ impl Row {
             utility_cpu: n(17),
             other_cpu: n(18),
             unread: f[19].trim().parse().ok(),
-            note: f[20..].join(","),
+            // Format lama (v0.1.6-v0.1.10) tanpa kolom page fault: 21 kolom.
+            pf_per_min: if f.len() >= 22 { n(20) } else { 0.0 },
+            note: if f.len() >= 22 { f[21..].join(",") } else { f[20..].join(",") },
         })
     }
+}
+
+// ----- domain yang dihubungi WebView2 -----
+
+static DOMAINS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DOMAINS: std::sync::Mutex<BTreeMap<String, (u64, u64)>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+pub fn set_domains_enabled(on: bool) {
+    DOMAINS_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn domains_enabled() -> bool {
+    DOMAINS_ON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Catat satu permintaan ke `host` (diblokir atau tidak). Hanya nama domain, tanpa alamat lengkap.
+pub fn record_domain(host: &str, blocked: bool) {
+    if let Ok(mut m) = DOMAINS.lock() {
+        let e = m.entry(host.to_ascii_lowercase()).or_insert((0, 0));
+        if blocked {
+            e.1 += 1;
+        } else {
+            e.0 += 1;
+        }
+    }
+}
+
+fn domains_path(dir: &Path) -> PathBuf {
+    dir.join("diagnostik-domain.txt")
+}
+
+/// Gabungkan hitungan di memori ke file (kumulatif antar-sesi), lalu kosongkan memori.
+pub fn flush_domains(dir: &Path) {
+    let fresh = match DOMAINS.lock() {
+        Ok(mut m) => std::mem::take(&mut *m),
+        Err(_) => return,
+    };
+    if fresh.is_empty() {
+        return;
+    }
+    let mut all = load_domains(dir);
+    for (h, (n, b)) in fresh {
+        let e = all.entry(h).or_insert((0, 0));
+        e.0 += n;
+        e.1 += b;
+    }
+    let mut out = String::new();
+    for (h, (n, b)) in &all {
+        let _ = writeln!(out, "{h}\t{n}\t{b}");
+    }
+    let _ = std::fs::write(domains_path(dir), out);
+}
+
+pub fn load_domains(dir: &Path) -> BTreeMap<String, (u64, u64)> {
+    let mut m = BTreeMap::new();
+    if let Ok(s) = std::fs::read_to_string(domains_path(dir)) {
+        for line in s.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() == 3 {
+                m.insert(
+                    f[0].to_string(),
+                    (f[1].parse().unwrap_or(0), f[2].parse().unwrap_or(0)),
+                );
+            }
+        }
+    }
+    m
+}
+
+/// Tabel domain untuk laporan, diurutkan dari yang paling sering.
+pub fn domains_report(dir: &Path) -> String {
+    let all = load_domains(dir);
+    if all.is_empty() {
+        return "Belum ada data domain (aktifkan Catat diagnostik).\n".into();
+    }
+    let mut v: Vec<(String, u64, u64)> = all.into_iter().map(|(h, (n, b))| (h, n, b)).collect();
+    v.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)).then(a.0.cmp(&b.0)));
+    let mut out = String::new();
+    let _ = writeln!(out, "{:<48} {:>10} {:>10}", "domain", "dimuat", "diblokir");
+    for (h, n, b) in v {
+        let _ = writeln!(out, "{h:<48} {n:>10} {b:>10}");
+    }
+    out
 }
 
 pub fn csv_path(dir: &Path) -> PathBuf {
@@ -345,12 +452,13 @@ pub fn summarize(rows: &[Row]) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{:<10} {:>6} | {:>17} | {:>8} | {:>8} | {:>17} | {:>8} | {:>6} | {:>8}",
-        "keadaan", "sampel", "RAM MB rata (min-maks)", "commit", "CPU % rt", "renderer utama", "rend.lain", "GPU", "CPU% maks"
+        "{:<10} {:>6} | {:>17} | {:>8} | {:>8} | {:>17} | {:>8} | {:>6} | {:>8} | {:>9}",
+        "keadaan", "sampel", "RAM MB rata (min-maks)", "commit", "CPU % rt", "renderer utama", "rend.lain", "GPU", "CPU% maks", "PF/mnt rt"
     );
     for (i, rs) in groups {
         let name = ORDER.get(i).copied().unwrap_or("lain");
-        let (mut ram, mut commit, mut cpu, mut rend, mut other, mut gpu) = (
+        let (mut ram, mut commit, mut cpu, mut rend, mut other, mut gpu, mut pf) = (
+            Stat::default(),
             Stat::default(),
             Stat::default(),
             Stat::default(),
@@ -365,10 +473,11 @@ pub fn summarize(rows: &[Row]) -> String {
             rend.add(r.renderer_main_mb);
             other.add(r.renderer_other_mb);
             gpu.add(r.gpu_mb);
+            pf.add(r.pf_per_min);
         }
         let _ = writeln!(
             out,
-            "{:<10} {:>6} | {:>6.0} ({:>4.0}-{:>4.0}) | {:>8.0} | {:>8.1} | {:>6.0} ({:>4.0}-{:>4.0}) | {:>8.0} | {:>6.0} | {:>8.1}",
+            "{:<10} {:>6} | {:>6.0} ({:>4.0}-{:>4.0}) | {:>8.0} | {:>8.1} | {:>6.0} ({:>4.0}-{:>4.0}) | {:>8.0} | {:>6.0} | {:>8.1} | {:>9.0}",
             name,
             ram.n,
             ram.avg(),
@@ -381,7 +490,8 @@ pub fn summarize(rows: &[Row]) -> String {
             rend.max,
             other.avg(),
             gpu.avg(),
-            cpu.max
+            cpu.max,
+            pf.avg()
         );
     }
     out
@@ -394,12 +504,12 @@ mod tests {
 
     fn procs(cpu: u64) -> Vec<Proc> {
         vec![
-            Proc { pid: 1, kind: Some(Kind::Aplikasi), working: 5 << 20, commit: 6 << 20, cpu_time: cpu },
-            Proc { pid: 2, kind: Some(Kind::Browser), working: 40 << 20, commit: 50 << 20, cpu_time: 0 },
-            Proc { pid: 3, kind: Some(Kind::Renderer), working: 300 << 20, commit: 400 << 20, cpu_time: cpu * 2 },
-            Proc { pid: 4, kind: Some(Kind::Renderer), working: 30 << 20, commit: 35 << 20, cpu_time: 0 },
-            Proc { pid: 5, kind: Some(Kind::Gpu), working: 13 << 20, commit: 20 << 20, cpu_time: 0 },
-            Proc { pid: 6, kind: None, working: 2 << 20, commit: 2 << 20, cpu_time: 0 },
+            Proc { pid: 1, kind: Some(Kind::Aplikasi), working: 5 << 20, commit: 6 << 20, cpu_time: cpu, page_faults: 0 },
+            Proc { pid: 2, kind: Some(Kind::Browser), working: 40 << 20, commit: 50 << 20, cpu_time: 0, page_faults: 0 },
+            Proc { pid: 3, kind: Some(Kind::Renderer), working: 300 << 20, commit: 400 << 20, cpu_time: cpu * 2, page_faults: 0 },
+            Proc { pid: 4, kind: Some(Kind::Renderer), working: 30 << 20, commit: 35 << 20, cpu_time: 0, page_faults: 0 },
+            Proc { pid: 5, kind: Some(Kind::Gpu), working: 13 << 20, commit: 20 << 20, cpu_time: 0, page_faults: 0 },
+            Proc { pid: 6, kind: None, working: 2 << 20, commit: 2 << 20, cpu_time: 0, page_faults: 0 },
         ]
     }
 
@@ -428,6 +538,44 @@ mod tests {
         let line = r1.to_csv();
         assert_eq!(line.split(',').count(), CSV_HEADER.split(',').count());
         assert_eq!(Row::from_csv(&line).unwrap(), r1);
+    }
+
+    #[test]
+    fn page_fault_dan_format_lama() {
+        let mut s = Sampler::new(1);
+        let t = Instant::now();
+        let mut p = procs(0);
+        s.row(t, "a".into(), State::Tray, &p, None, "");
+        for x in &mut p {
+            x.page_faults += 100; // 6 proses x 100 = 600 dalam 30 detik = 1200/menit
+        }
+        let r = s.row(t + Duration::from_secs(30), "b".into(), State::Tray, &p, Some(4), "x");
+        assert_eq!(r.pf_per_min, 1200.0);
+        assert_eq!(Row::from_csv(&r.to_csv()).unwrap(), r);
+        // Baris versi lama (21 kolom) tetap terbaca.
+        let old = "2026-11-10 18:54:04,tray,8,26.3,488.9,0.2,1.8,6.7,10.7,0,1.6,5.5,0,0.2,0,0,0,0,0,5,laporan dibuat";
+        let o = Row::from_csv(old).unwrap();
+        assert_eq!(o.unread, Some(5));
+        assert_eq!(o.pf_per_min, 0.0);
+        assert_eq!(o.note, "laporan dibuat");
+    }
+
+    #[test]
+    fn catatan_domain() {
+        let dir = std::env::temp_dir().join(format!("olite-dom-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        record_domain("Outlook.Cloud.Microsoft", false);
+        record_domain("outlook.cloud.microsoft", false);
+        record_domain("browser.events.data.microsoft.com", true);
+        flush_domains(&dir);
+        record_domain("outlook.cloud.microsoft", false);
+        flush_domains(&dir);
+        let m = load_domains(&dir);
+        assert_eq!(m["outlook.cloud.microsoft"], (3, 0));
+        assert_eq!(m["browser.events.data.microsoft.com"], (0, 1));
+        let rep = domains_report(&dir);
+        assert!(rep.lines().nth(1).unwrap().starts_with("outlook.cloud.microsoft"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
