@@ -17,7 +17,6 @@ pub struct TreeMem {
     pub working: u64,
     /// Private bytes / commit (memori yang benar-benar dialokasikan, termasuk yang di page file), byte.
     pub commit: u64,
-    pub count: u32,
 }
 
 pub struct ToastSpec {
@@ -374,7 +373,6 @@ mod imp {
         Some(TreeMem {
             working: procs.iter().map(|p| p.working).sum(),
             commit: procs.iter().map(|p| p.commit).sum(),
-            count: procs.len() as u32,
         })
     }
 
