@@ -244,23 +244,6 @@ impl Settings {
         }
     }
 
-    pub fn work_hours_label(&self) -> String {
-        let mut days: Vec<u8> = self.work_days.clone();
-        days.sort_unstable();
-        days.dedup();
-        const NAMES: [&str; 7] = ["Sen", "Sel", "Rab", "Kam", "Jum", "Sab", "Min"];
-        let d = if days == [1, 2, 3, 4, 5] {
-            "Sen–Jum".to_string()
-        } else if days == [1, 2, 3, 4, 5, 6] {
-            "Sen–Sab".to_string()
-        } else {
-            days.iter()
-                .map(|d| NAMES[(*d as usize).saturating_sub(1).min(6)])
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        format!("{}–{}, {d}", self.work_start, self.work_end)
-    }
 }
 
 #[cfg(test)]
@@ -301,7 +284,6 @@ mod tests {
         assert_eq!(s2.zoom, 1.0);
         let j = serde_json::to_string(&s2).unwrap();
         assert_eq!(serde_json::from_str::<Settings>(&j).unwrap(), s2);
-        assert_eq!(Settings::default().work_hours_label(), "08:00–17:00, Sen–Jum");
     }
 
     #[test]

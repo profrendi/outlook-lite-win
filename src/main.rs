@@ -547,13 +547,6 @@ fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> 
 const TOGGLE_ALTS: [&str; 3] = ["Ctrl+Alt+O", "Ctrl+Shift+Alt+O", "Ctrl+Alt+K"];
 const COMPOSE_ALTS: [&str; 3] = ["Ctrl+Alt+N", "Ctrl+Alt+M", "Ctrl+Shift+Alt+N"];
 
-fn hotkey_label(s: &Settings) -> String {
-    format!(
-        "Hotkey ({} buka/tutup, {} email baru)",
-        s.hotkey_toggle, s.hotkey_compose
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Aplikasi
 
