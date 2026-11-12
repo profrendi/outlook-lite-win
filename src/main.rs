@@ -456,6 +456,25 @@ fn tray_image(badge: Badge) -> Option<TrayImage> {
     TrayImage::from_rgba(icon::rgba(32, badge), 32, 32).ok()
 }
 
+/// Tema bilah judul jendela (None = ikut Windows).
+fn window_theme(t: &str) -> Option<tao::window::Theme> {
+    match t {
+        "light" => Some(tao::window::Theme::Light),
+        "dark" => Some(tao::window::Theme::Dark),
+        _ => None,
+    }
+}
+
+/// Tema isi WebView2 (prefers-color-scheme). Berlaku untuk satu profil: Pengaturan & Outlook.
+#[cfg(windows)]
+fn webview_theme(t: &str) -> wry::Theme {
+    match t {
+        "light" => wry::Theme::Light,
+        "dark" => wry::Theme::Dark,
+        _ => wry::Theme::Auto,
+    }
+}
+
 fn window_image() -> Option<WindowIcon> {
     WindowIcon::from_rgba(icon::rgba(32, Badge::None), 32, 32).ok()
 }
@@ -974,6 +993,7 @@ impl App {
         let mut wb = WindowBuilder::new()
             .with_title("Outlook Lite")
             .with_window_icon(window_image())
+            .with_theme(window_theme(&self.settings.theme))
             .with_visible(visible);
         wb = match self.valid_geom(target) {
             Some(g) => wb
@@ -1038,6 +1058,7 @@ impl App {
         #[cfg(windows)]
         let builder = {
             use wry::WebViewBuilderExtWindows;
+            let builder = builder.with_theme(webview_theme(&self.settings.theme));
             match custom_env {
                 Some(env) => builder.with_environment(env),
                 None => builder.with_additional_browser_args(args),
@@ -1509,6 +1530,7 @@ impl App {
         let mut wb = WindowBuilder::new()
             .with_title("Pengaturan Outlook Lite")
             .with_window_icon(window_image())
+            .with_theme(window_theme(&self.settings.theme))
             .with_inner_size(size)
             .with_min_inner_size(LogicalSize::new(360.0, 420.0));
         // Di pojok kanan bawah, dekat ikon tray.
@@ -1547,6 +1569,7 @@ impl App {
         #[cfg(windows)]
         let builder = {
             use wry::WebViewBuilderExtWindows;
+            let builder = builder.with_theme(webview_theme(&self.settings.theme));
             match env {
                 Some(env) => builder.with_environment(env),
                 None => builder.with_additional_browser_args(args),
@@ -1557,6 +1580,24 @@ impl App {
                 self.settings_win = Some(SettingsWin { window, webview });
             }
             Err(e) => self.log(&format!("halaman pengaturan gagal: {e}")),
+        }
+    }
+
+    /// Terapkan tema ke jendela yang sedang terbuka (bilah judul + isi WebView2).
+    fn apply_theme(&self) {
+        let t = self.settings.theme.as_str();
+        let wins = self
+            .settings_win
+            .iter()
+            .map(|w| (&w.window, &w.webview))
+            .chain(self.inst.iter().map(|i| (&i.window, &i.webview)));
+        for (window, _webview) in wins {
+            window.set_theme(window_theme(t));
+            #[cfg(windows)]
+            {
+                use wry::WebViewExtWindows;
+                let _ = _webview.set_theme(webview_theme(t));
+            }
         }
     }
 
@@ -1657,6 +1698,7 @@ impl App {
             // Dipasang saat Outlook dibuat: muat ulang Outlook.
             "block_telemetry" | "unread_selector" => self.recreate_instance(target),
             "shortcuts" => self.build_tray(),
+            "theme" => self.apply_theme(),
             _ => {}
         }
         self.tick(target);

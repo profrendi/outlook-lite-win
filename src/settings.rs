@@ -61,6 +61,8 @@ pub struct Settings {
     pub block_telemetry: bool,
     /// Mode perangkat RAM kecil Chromium (berlaku setelah restart).
     pub low_end_mode: bool,
+    /// Tema jendela Pengaturan & Outlook Lite: "system", "light", atau "dark".
+    pub theme: String,
     /// Buat environment WebView2 sendiri (opsi resmi di bawah). Bila gagal, otomatis cara lama.
     pub custom_environment: bool,
     /// Tracking prevention WebView2 (daftar pelacak). Mati = lebih ringan; aman karena hanya Outlook.
@@ -123,6 +125,7 @@ impl Default for Settings {
             efficiency_mode: true,
             block_telemetry: true,
             low_end_mode: true,
+            theme: "system".into(),
             custom_environment: true,
             tracking_prevention: false,
             local_crash_reports: true,
@@ -199,6 +202,9 @@ impl Settings {
             self.refresh_mb = self.refresh_mb.clamp(300, 8000);
         }
         self.refresh_hours = self.refresh_hours.min(72);
+        if !matches!(self.theme.as_str(), "system" | "light" | "dark") {
+            self.theme = "system".into();
+        }
         if self.trim_ws_mb != 0 {
             self.trim_ws_mb = self.trim_ws_mb.clamp(15, 2000);
         }

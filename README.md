@@ -77,7 +77,9 @@ Ikon tray: **titik merah** = ada email belum dibaca, **titik kuning** = perlu lo
 
 ## Jendela Pengaturan
 
-Muncul di pojok kanan bawah (dekat tray), mengikuti tema terang/gelap Windows. Semua yang
+Muncul di pojok kanan bawah (dekat tray). Tema bisa dipilih di kanan atas: **Sistem**, **Terang**,
+atau **Gelap**; berlaku juga untuk jendela Outlook (bilah judul, dan isi Outlook web bila tema
+Outlook web disetel mengikuti sistem). Semua yang
 sebelumnya hanya bisa diubah di `settings.json` kini bisa diubah di sini dan langsung disimpan:
 
 - **Aksi cepat**: Buka Email, Kalender, Email baru, Cek email sekarang, dan tombol pintasan.
@@ -192,6 +194,7 @@ Di `%LOCALAPPDATA%\OutlookLite\settings.json`. Setelah diubah manual, pilih
   "efficiency_mode": true,
   "block_telemetry": true,
   "low_end_mode": true,
+  "theme": "system",
   "custom_environment": true,
   "tracking_prevention": false,
   "local_crash_reports": true,

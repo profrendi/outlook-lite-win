@@ -11,12 +11,24 @@
     --switch-off: #c4c9d1; --chip: #eef1f5;
   }
   @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme="light"]) {
       --bg: #1c1d21; --card: #26282d; --text: #e9ebef; --muted: #a3a9b4; --line: #363940;
       --accent: #4ca0e8; --accent-text: #0b1520; --warn-bg: #4a3d12; --warn-text: #ffe8a3;
-      --switch-off: #50545c; --chip: #31343a;
+      --switch-off: #50545c; --chip: #31343a; color-scheme: dark;
     }
   }
+  :root[data-theme="dark"] {
+    --bg: #1c1d21; --card: #26282d; --text: #e9ebef; --muted: #a3a9b4; --line: #363940;
+    --accent: #4ca0e8; --accent-text: #0b1520; --warn-bg: #4a3d12; --warn-text: #ffe8a3;
+    --switch-off: #50545c; --chip: #31343a; color-scheme: dark;
+  }
+  :root[data-theme="light"] { color-scheme: light; }
+  .seg { display: inline-flex; background: var(--chip); border-radius: 7px; padding: 2px; margin-left: auto; }
+  .seg label { position: relative; }
+  .seg input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+  .seg span { display: block; padding: 3px 9px; border-radius: 5px; font-size: 12px; color: var(--muted); }
+  .seg input:checked + span { background: var(--card); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.15); }
+  .seg input:focus-visible + span { outline: 2px solid var(--accent); }
   * { box-sizing: border-box; }
   html, body { margin: 0; background: var(--bg); color: var(--text);
     font: 13px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
@@ -77,6 +89,11 @@
 <header>
   <div class="logo">O</div>
   <div><h1>Outlook Lite <span id="ver" class="muted"></span></h1><div class="status" id="status">Memuat…</div></div>
+  <div class="seg" role="radiogroup" aria-label="Tema" title="Tema">
+    <label><input type="radio" name="theme" value="system" data-key="theme"><span>Sistem</span></label>
+    <label><input type="radio" name="theme" value="light" data-key="theme"><span>Terang</span></label>
+    <label><input type="radio" name="theme" value="dark" data-key="theme"><span>Gelap</span></label>
+  </div>
 </header>
 
 <div class="banner" id="restartBanner"><span>Beberapa perubahan baru berlaku setelah aplikasi dimulai ulang.</span>
@@ -228,6 +245,10 @@
   const $ = (s) => document.querySelector(s);
   const DAYS = [[1, 'Sen'], [2, 'Sel'], [3, 'Rab'], [4, 'Kam'], [5, 'Jum'], [6, 'Sab'], [7, 'Min']];
   let state = null;
+  const applyTheme = (t) => {
+    if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+    else delete document.documentElement.dataset.theme;
+  };
 
   $('#days').innerHTML = DAYS.map(([n, t]) =>
     `<label><input type="checkbox" value="${n}"><b>${t}</b></label>`).join('');
@@ -251,7 +272,8 @@
     const key = el.dataset.key;
     if (!key) return;
     let value;
-    if (el.type === 'checkbox') value = el.checked;
+    if (el.type === 'radio') { if (!el.checked) return; value = el.value; applyTheme(value); }
+    else if (el.type === 'checkbox') value = el.checked;
     else if (el.type === 'number') { value = el.value === '' ? 0 : Math.round(+el.value); }
     else if (key === 'unread_selector') value = el.value.trim() || null;
     else value = el.value;
@@ -283,6 +305,7 @@
       state = st;
       const s = st.s;
       $('#ver').textContent = 'v' + st.version;
+      applyTheme(s.theme);
       $('#status').textContent = st.status;
       $('#restartBanner').classList.toggle('on', !!st.restart);
       $('#updateBanner').classList.toggle('on', !!st.update);
@@ -291,7 +314,8 @@
       for (const el of document.querySelectorAll('[data-key], [data-state]')) {
         if (el === document.activeElement && el.type !== 'checkbox') continue; // jangan timpa yang sedang diketik
         const v = el.dataset.state ? st[el.dataset.state] : s[el.dataset.key];
-        if (el.type === 'checkbox') el.checked = !!v;
+        if (el.type === 'radio') el.checked = (v || 'system') === el.value;
+        else if (el.type === 'checkbox') el.checked = !!v;
         else el.value = v == null ? '' : v;
       }
       for (const i of document.querySelectorAll('#days input')) i.checked = s.work_days.includes(+i.value);
