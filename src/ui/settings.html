@@ -23,7 +23,9 @@
     --switch-off: #50545c; --chip: #31343a; color-scheme: dark;
   }
   :root[data-theme="light"] { color-scheme: light; }
-  .seg { display: inline-flex; background: var(--chip); border-radius: 7px; padding: 2px; margin-left: auto; }
+  .hdr-right { margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex: none; }
+  .hdr-right button { padding: 3px 10px; font-size: 12px; }
+  .seg { display: inline-flex; background: var(--chip); border-radius: 7px; padding: 2px; }
   .seg label { position: relative; }
   .seg input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
   .seg span { display: block; padding: 3px 9px; border-radius: 5px; font-size: 12px; color: var(--muted); }
@@ -33,8 +35,9 @@
   html, body { margin: 0; background: var(--bg); color: var(--text);
     font: 13px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
   body { padding: 12px 12px 20px; }
-  header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-  header .logo { width: 32px; height: 32px; border-radius: 8px; background: var(--accent);
+  header { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 10px; }
+  header > div:nth-child(2) { min-width: 0; }
+  header .logo { flex: none; width: 32px; height: 32px; border-radius: 8px; background: var(--accent);
     color: var(--accent-text); display: grid; place-items: center; font-weight: 700; font-size: 15px; }
   header h1 { font-size: 15px; margin: 0; }
   header .status { color: var(--muted); font-size: 12px; }
@@ -89,10 +92,13 @@
 <header>
   <div class="logo">O</div>
   <div><h1>Outlook Lite <span id="ver" class="muted"></span></h1><div class="status" id="status">Memuat…</div></div>
-  <div class="seg" role="radiogroup" aria-label="Tema" title="Tema">
-    <label><input type="radio" name="theme" value="system" data-key="theme"><span>Sistem</span></label>
-    <label><input type="radio" name="theme" value="light" data-key="theme"><span>Terang</span></label>
-    <label><input type="radio" name="theme" value="dark" data-key="theme"><span>Gelap</span></label>
+  <div class="hdr-right">
+    <div class="seg" role="radiogroup" aria-label="Tema" title="Tema">
+      <label><input type="radio" name="theme" value="system" data-key="theme"><span>Sistem</span></label>
+      <label><input type="radio" name="theme" value="light" data-key="theme"><span>Terang</span></label>
+      <label><input type="radio" name="theme" value="dark" data-key="theme"><span>Gelap</span></label>
+    </div>
+    <button data-menu="check_update">Cek update</button>
   </div>
 </header>
 
@@ -196,9 +202,8 @@
     <div class="row"><div class="label">Email baru</div><input type="text" style="width:150px" data-key="hotkey_compose" spellcheck="false"></div>
     <div class="row"><div class="label">Aplikasi email default (mailto)<span class="hint">Tautan email membuka layar tulis Outlook.</span></div>
       <label class="switch"><input type="checkbox" data-state="mailto" data-menu="mailto"><span></span></label></div>
-    <div class="row"><div class="label">Update otomatis</div>
+    <div class="row"><div class="label">Update otomatis<span class="hint">Cek update sekarang: tombol di kanan atas.</span></div>
       <label class="switch"><input type="checkbox" data-key="auto_update"><span></span></label></div>
-    <div class="btns"><button data-menu="check_update">Cek update sekarang</button></div>
   </div>
 </details>
 
