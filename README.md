@@ -69,8 +69,9 @@ Demi privasi mailbox, toast tidak berisi pengirim atau subjek. Aktifkan *Tampilk
 Klik kiri ikon = buka jendela Outlook. Klik kanan (menu ringkas):
 
 - **Status** (keadaan, jumlah belum dibaca, RAM & CPU bila diagnostik aktif)
-- Buka Email · Buka Kalender · Email baru · Pintasan · **Cek email sekarang**
-- **Pengaturan…** → jendela pengaturan
+- **Cek email sekarang**
+- **Pengaturan…** → jendela pengaturan (Buka Email, Kalender, Email baru, pintasan, dan semua
+  pengaturan ada di sana)
 - Restart untuk memakai versi baru · Tutup jendela · Keluar
 
 Ikon tray: **titik merah** = ada email belum dibaca, **titik kuning** = perlu login ulang.

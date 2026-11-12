@@ -39,7 +39,7 @@ use tao::{
     window::{Icon as WindowIcon, Window, WindowBuilder, WindowId},
 };
 use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon as TrayImage, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 use wry::{NewWindowResponse, PageLoadEvent, WebContext, WebView, WebViewBuilder};
@@ -523,35 +523,19 @@ struct TrayMenu {
     restart_update: MenuItem,
 }
 
-/// Menu tray ringkas; semua pengaturan ada di jendela Pengaturan.
-fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> {
+/// Menu tray ringkas. Buka Email/Kalender, Email baru, Pintasan, dan semua pengaturan ada di
+/// jendela Pengaturan; klik kiri ikon tray membuka Outlook.
+fn build_menu(_s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> {
     let item = |i: &str, t: &str| MenuItem::with_id(i, t, true, None);
     let sep = PredefinedMenuItem::separator;
 
     let status = MenuItem::with_id("status", "Outlook Lite", false, None);
     let restart_update = MenuItem::with_id(id::RESTART_UPDATE, "Tidak ada update", false, None);
 
-    let shortcut_items: Vec<MenuItem> = s
-        .shortcuts
-        .iter()
-        .enumerate()
-        .map(|(i, sc)| item(&format!("{}{i}", id::SHORTCUT), &sc.name))
-        .collect();
-    let shortcut_refs: Vec<&dyn tray_icon::menu::IsMenuItem> = shortcut_items
-        .iter()
-        .map(|c| c as &dyn tray_icon::menu::IsMenuItem)
-        .collect();
-    let shortcuts = Submenu::with_items("Pintasan", !shortcut_items.is_empty(), &shortcut_refs)?;
-
     let menu = Menu::with_items(&[
         &status,
         &sep(),
-        &item(id::OPEN_MAIL, "Buka Email"),
-        &item(id::OPEN_CAL, "Buka Kalender"),
-        &item(id::COMPOSE, "Email baru"),
-        &shortcuts,
         &item(id::CHECK_NOW, "Cek email sekarang"),
-        &sep(),
         &item(id::SETTINGS, "Pengaturan…"),
         &sep(),
         &restart_update,
