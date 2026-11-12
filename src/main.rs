@@ -95,6 +95,9 @@ const REFRESH_MIN_HIDDEN: Duration = Duration::from_secs(10 * 60);
 /// Setelah halaman disegarkan, angka belum dibaca sempat tidak stabil: jangan dianggap email baru.
 const REFRESH_SETTLE: Duration = Duration::from_secs(90);
 const BG_CHECK_TIMEOUT: Duration = Duration::from_secs(75);
+/// "Cek email sekarang" saat Outlook sudah hidup: bila halaman tidak menjawab dalam waktu ini,
+/// Outlook dimuat ulang lalu ditunggu sampai BG_CHECK_TIMEOUT.
+const MANUAL_ANSWER_WAIT: Duration = Duration::from_secs(6);
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(90);
 const CREATE_RETRY: Duration = Duration::from_secs(300);
 const UPDATE_EVERY: Duration = Duration::from_secs(24 * 3600);
@@ -624,6 +627,8 @@ struct App {
     started: Instant,
     last_mode: Mode,
     bg_deadline: Option<Instant>,
+    /// Cek manual sudah mencoba memuat ulang Outlook (tahap kedua).
+    manual_reloaded: bool,
     manual_check: bool,
     inspect_pending: bool,
     inspect_sent: bool,
@@ -1297,6 +1302,15 @@ impl App {
     fn start_bg_check(&mut self, target: &EventLoopWindowTarget<UserEvent>, manual: bool) {
         if manual {
             self.manual_check = true;
+            self.manual_reloaded = false;
+            let st = match &self.inst {
+                None => "Outlook belum hidup",
+                Some(i) if !i.visible => "di tray",
+                Some(i) if i.minimized => "diminimalkan",
+                Some(_) => "jendela terbuka",
+            };
+            self.log(&format!("cek email: mulai ({st})"));
+            self.diag_note(&format!("cek email: mulai ({st})"));
         }
         if self.inst.is_some() {
             // Outlook sudah hidup: bangunkan bila tidur, lalu minta pemantau melapor.
@@ -1334,10 +1348,15 @@ impl App {
                         let _ = inst.webview.load_url(MAIL_URL);
                     }
                 }
-                self.bg_deadline.get_or_insert(
+                // Halaman Email: harus menjawab cepat; kalau tidak, dimuat ulang (lihat tick).
+                // Kalender/Kontak: menunggu Email dimuat.
+                if !on_mail {
+                    self.manual_reloaded = true;
+                }
+                self.bg_deadline = Some(
                     Instant::now()
                         + if on_mail {
-                            Duration::from_secs(20)
+                            MANUAL_ANSWER_WAIT
                         } else {
                             BG_CHECK_TIMEOUT
                         },
@@ -1346,10 +1365,34 @@ impl App {
             return;
         }
         if self.create_instance(target, MAIL_URL, false) {
+            self.manual_reloaded = true;
             self.bg_deadline = Some(Instant::now() + BG_CHECK_TIMEOUT);
         } else {
             self.manual_check = false;
         }
+    }
+
+    /// Selesaikan "Cek email sekarang" memakai angka terakhir yang diketahui, bila ada.
+    /// Mengembalikan false bila tidak ada angka sama sekali.
+    fn report_manual_last_known(&mut self, why: &str) -> bool {
+        let Some(n) = self.shown_unread().filter(|n| *n >= 0) else {
+            return false;
+        };
+        self.manual_check = false;
+        let body = if n > 0 {
+            format!("Belum dibaca di Inbox: {n}")
+        } else {
+            "Tidak ada email belum dibaca di Inbox.".into()
+        };
+        self.toast(
+            "Outlook Lite",
+            &body,
+            None,
+            Some(false),
+        );
+        self.log(&format!("cek email: memakai angka terakhir {n} ({why})"));
+        self.diag_note(&format!("cek email: angka terakhir {n} ({why})"));
+        true
     }
 
     fn on_process_failed(&mut self, kind: i32) {
@@ -2145,15 +2188,22 @@ impl App {
                 self.inspect_sent = true;
             }
         }
-        if unread < 0 && force && self.manual_check && self.unread.is_none() {
-            // Halaman termuat tapi panel folder tidak tampil.
-            self.manual_check = false;
-            self.toast(
-                "Jumlah belum dibaca tidak terbaca",
-                "Panel folder Outlook tidak tampil. Lebarkan jendela Outlook Lite atau tampilkan panel folder.",
-                None,
-                Some(false),
-            );
+        if unread < 0 && force && self.manual_check {
+            // Halaman menjawab, tapi panel folder tidak terbaca (mis. jendela terlalu sempit,
+            // atau halaman Outlook belum selesai dimuat).
+            self.log(&format!("cek email: halaman menjawab tapi Inbox tidak terbaca ({})", self.unread_how));
+            if !self.report_manual_last_known("panel folder tidak terbaca") {
+                self.manual_check = false;
+                self.toast(
+                    "Jumlah belum dibaca tidak terbaca",
+                    "Panel folder Outlook tidak tampil. Buka jendela, lebarkan, atau tampilkan panel folder.",
+                    None,
+                    Some(false),
+                );
+            }
+            if self.bg_deadline.is_some() && !self.inspect_pending {
+                self.finish_bg_check();
+            }
         }
         if unread >= 0 {
             let prev = self.unread;
@@ -2161,6 +2211,8 @@ impl App {
             self.note_count(prev, unread);
             if self.manual_check {
                 self.manual_check = false;
+                self.log(&format!("cek email: berhasil, belum dibaca {unread}"));
+                self.diag_note(&format!("cek email: berhasil ({unread})"));
                 self.report_manual(self.shown_unread().unwrap_or(unread));
             }
             if self.bg_deadline.is_some() && !self.inspect_pending {
@@ -2392,26 +2444,54 @@ impl App {
 
         // Batas waktu cek/diagnostik tersembunyi.
         if self.bg_deadline.is_some_and(|d| now >= d) {
-            if self.manual_check {
-                self.manual_check = false;
-                self.toast(
-                    "Cek email gagal",
-                    "Outlook belum termuat. Buka jendela untuk memeriksa login.",
-                    None,
-                    Some(false),
-                );
+            if self.manual_check && !self.manual_reloaded && self.inst.is_some() && !self.inspect_pending {
+                // Halaman tidak menjawab (mis. tertidur lama di tray): muat ulang Outlook lalu
+                // tunggu lagi, sama seperti membuka ulang aplikasi.
+                self.manual_reloaded = true;
+                self.log("cek email: halaman tidak menjawab, memuat ulang Outlook");
+                self.diag_note("cek email: halaman tidak menjawab, muat ulang");
+                if let Some(inst) = &self.inst {
+                    let _ = inst.webview.load_url(MAIL_URL);
+                }
+                self.settle_until = Some(now + REFRESH_SETTLE);
+                self.bg_deadline = Some(now + BG_CHECK_TIMEOUT);
+            } else {
+                if self.manual_check {
+                    let why = if self.needs_login {
+                        "perlu login"
+                    } else if self.net.failing() {
+                        "tidak ada koneksi"
+                    } else {
+                        "Outlook tidak menjawab"
+                    };
+                    self.log(&format!("cek email: batas waktu habis ({why})"));
+                    self.diag_note(&format!("cek email: gagal ({why})"));
+                    if !self.report_manual_last_known(why) {
+                        self.manual_check = false;
+                        self.toast(
+                            "Cek email gagal",
+                            match why {
+                                "perlu login" => "Outlook meminta login ulang. Buka jendela untuk login.",
+                                "tidak ada koneksi" => "Tidak ada koneksi internet. Outlook Lite akan mencoba lagi otomatis.",
+                                _ => "Outlook belum termuat. Buka jendela untuk memeriksa login.",
+                            },
+                            None,
+                            Some(false),
+                        );
+                    }
+                }
+                if self.inspect_pending {
+                    self.inspect_pending = false;
+                    self.inspect_sent = false;
+                    self.toast(
+                        "Diagnostik halaman gagal",
+                        "Buka Outlook, pastikan sudah login, lalu coba lagi.",
+                        None,
+                        Some(false),
+                    );
+                }
+                self.finish_bg_check();
             }
-            if self.inspect_pending {
-                self.inspect_pending = false;
-                self.inspect_sent = false;
-                self.toast(
-                    "Diagnostik halaman gagal",
-                    "Buka Outlook, pastikan sudah login, lalu coba lagi.",
-                    None,
-                    Some(false),
-                );
-            }
-            self.finish_bg_check();
         }
 
         // Jendela tersembunyi yang tidak lagi dibutuhkan (mis. jam kerja selesai).
@@ -2926,6 +3006,7 @@ fn main() {
         started: Instant::now(),
         last_mode: Mode::Jeda,
         bg_deadline: None,
+        manual_reloaded: false,
         manual_check: false,
         inspect_pending: false,
         inspect_sent: false,
