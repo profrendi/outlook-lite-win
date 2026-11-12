@@ -25,6 +25,8 @@
   :root[data-theme="light"] { color-scheme: light; }
   .hdr-right { margin-left: auto; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex: none; }
   .hdr-right button { padding: 3px 10px; font-size: 12px; }
+  .upd-msg { display: none; text-align: right; font-size: 12px; color: var(--muted); margin: -4px 0 10px; }
+  .upd-msg.on { display: block; }
   .seg { display: inline-flex; background: var(--chip); border-radius: 7px; padding: 2px; }
   .seg label { position: relative; }
   .seg input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
@@ -101,6 +103,7 @@
     <button data-menu="check_update">Cek update</button>
   </div>
 </header>
+<div class="upd-msg" id="updateMsg"></div>
 
 <div class="banner" id="restartBanner"><span>Beberapa perubahan baru berlaku setelah aplikasi dimulai ulang.</span>
   <button class="primary" data-act="restart">Restart sekarang</button></div>
@@ -315,6 +318,8 @@
       $('#restartBanner').classList.toggle('on', !!st.restart);
       $('#updateBanner').classList.toggle('on', !!st.update);
       if (st.update) $('#updateText').textContent = 'Versi baru v' + st.update + ' siap dipakai.';
+      $('#updateMsg').textContent = st.update_msg || '';
+      $('#updateMsg').classList.toggle('on', !!st.update_msg);
       $('#zoomPct').textContent = Math.round(s.zoom * 100) + '%';
       for (const el of document.querySelectorAll('[data-key], [data-state]')) {
         if (el === document.activeElement && el.type !== 'checkbox') continue; // jangan timpa yang sedang diketik

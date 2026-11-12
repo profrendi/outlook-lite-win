@@ -60,7 +60,7 @@ const MAGIC: &str = "OUTLOOKLITE1";
 /// IntensiveWakeUpThrottling: halaman tersembunyi tidak diperlambat (notifikasi).
 /// SpareRendererForSitePerProcess: tanpa proses renderer cadangan yang menganggur.
 /// BackForwardCache: halaman lama tidak disimpan di memori.
-const DISABLED_FEATURES: &str = "msWebOOUI,msPdfOOUI,msSmartScreenProtection,IntensiveWakeUpThrottling,SpareRendererForSitePerProcess,BackForwardCache,Translate,MediaRouter,OptimizationHints,AutofillServerCommunication";
+const DISABLED_FEATURES: &str = "msWebOOUI,msPdfOOUI,msSmartScreenProtection,IntensiveWakeUpThrottling,SpareRendererForSitePerProcess,BackForwardCache,Translate,MediaRouter,OptimizationHints,AutofillServerCommunication,CalculateNativeWinOcclusion";
 /// Telemetri Outlook web/Office (pengukuran pemakaian ke Microsoft). Tidak dibutuhkan untuk
 /// email; diblokir di dalam WebView2 supaya tidak ada kerja jaringan & CPU tambahan.
 const TELEMETRY_HOSTS: &[&str] = &[
@@ -98,6 +98,12 @@ const BG_CHECK_TIMEOUT: Duration = Duration::from_secs(75);
 /// "Cek email sekarang" saat Outlook sudah hidup: bila halaman tidak menjawab dalam waktu ini,
 /// Outlook dimuat ulang lalu ditunggu sampai BG_CHECK_TIMEOUT.
 const MANUAL_ANSWER_WAIT: Duration = Duration::from_secs(6);
+/// Outlook yang dimuat saat tersembunyi tidak menggambar halamannya (panel folder kosong).
+/// WebView2 sementara dibuat "terlihat" (jendela tetap tersembunyi) paling lama selama ini,
+/// sampai Inbox terbaca.
+const WARM_RENDER_MAX: Duration = Duration::from_secs(45);
+/// Cek email di tray saat Inbox belum terbaca: tunggu halaman digambar paling lama selama ini.
+const MANUAL_WARM_WAIT: Duration = Duration::from_secs(15);
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(90);
 const CREATE_RETRY: Duration = Duration::from_secs(300);
 const UPDATE_EVERY: Duration = Duration::from_secs(24 * 3600);
@@ -629,6 +635,13 @@ struct App {
     bg_deadline: Option<Instant>,
     /// Cek manual sudah mencoba memuat ulang Outlook (tahap kedua).
     manual_reloaded: bool,
+    /// Cek manual sudah mencoba menggambar halaman tersembunyi.
+    manual_warm_tried: bool,
+    /// Render hangat aktif sampai waktu ini (lihat WARM_RENDER_MAX).
+    warm_until: Option<Instant>,
+    warm_started: Option<Instant>,
+    /// Pesan hasil cek update terakhir (tampil di jendela Pengaturan).
+    update_msg: Option<String>,
     manual_check: bool,
     inspect_pending: bool,
     inspect_sent: bool,
@@ -1109,6 +1122,9 @@ impl App {
         self.hidden_since = (!visible).then(Instant::now);
         // Rapikan setelah Outlook selesai dimuat.
         self.trim_at = (!visible).then(|| Instant::now() + TRIM_DELAY * 4);
+        if !visible {
+            self.start_warm("Outlook dibuat tersembunyi");
+        }
         self.inst = Some(Instance {
             window,
             webview,
@@ -1138,10 +1154,14 @@ impl App {
         self.low_unfocused = false;
         self.background_mode = false;
         self.next_trim_check = None;
+        self.warm_until = None;
+        self.warm_started = None;
     }
 
     fn show(&mut self, target: &EventLoopWindowTarget<UserEvent>, url: Option<&str>) {
         self.bg_deadline = None;
+        self.warm_until = None;
+        self.warm_started = None;
         self.net.poke(Instant::now());
         // Outlook tersembunyi bertampilan mobile tidak dipakai untuk jendela: buat versi desktop.
         if self.inst.as_ref().is_some_and(|i| i.mobile) {
@@ -1203,16 +1223,19 @@ impl App {
                 inst.window.set_visible(false);
                 inst.visible = false;
                 // Sama seperti minimize: WebView2 berhemat, halaman tetap memantau.
+                // Halaman Outlook (Email/Kalender/Kontak) tidak dimuat ulang. Halaman lain
+                // (To Do, intranet) tidak memantau email, jadi kembali ke Email; Outlook yang
+                // dimuat saat tersembunyi digambar dulu lewat render hangat (on_page_loaded).
                 let _ = inst.webview.set_visible(false);
-                // Jumlah belum dibaca hanya terbaca di halaman Email
-                // (bukan Kalender/Kontak atau pintasan seperti To Do).
-                if !inst.webview.url().is_ok_and(|u| is_outlook_mail_url(&u)) {
+                if !inst.webview.url().is_ok_and(|u| is_outlook_url(&u)) {
                     let _ = inst.webview.load_url(MAIL_URL);
                 }
                 if self.settings.low_memory {
                     set_memory_low(&inst.webview, true);
                 }
             }
+            self.warm_until = None;
+            self.warm_started = None;
             self.focused = false;
             self.unfocused_since = None;
             self.hidden_since = Some(Instant::now());
@@ -1303,6 +1326,7 @@ impl App {
         if manual {
             self.manual_check = true;
             self.manual_reloaded = false;
+            self.manual_warm_tried = false;
             let st = match &self.inst {
                 None => "Outlook belum hidup",
                 Some(i) if !i.visible => "di tray",
@@ -1370,6 +1394,41 @@ impl App {
         } else {
             self.manual_check = false;
         }
+    }
+
+    /// Render hangat: Outlook tersembunyi baru dimuat tidak menggambar halamannya, jadi panel
+    /// folder (jumlah belum dibaca) tidak ada. WebView2 dibuat "terlihat" sementara — jendela
+    /// tetap tersembunyi — sampai Inbox terbaca, lalu kembali hemat.
+    fn start_warm(&mut self, why: &str) {
+        let Some(inst) = &self.inst else { return };
+        if inst.visible {
+            return;
+        }
+        let _ = inst.webview.set_visible(true);
+        set_memory_low(&inst.webview, false);
+        let now = Instant::now();
+        self.warm_until = Some(now + WARM_RENDER_MAX);
+        self.warm_started.get_or_insert(now);
+        self.next_tick = self.next_tick.min(now + WARM_RENDER_MAX);
+        self.diag_note(&format!("render tersembunyi mulai ({why})"));
+    }
+
+    fn end_warm(&mut self, why: &str) {
+        if self.warm_until.take().is_none() {
+            return;
+        }
+        let secs = self.warm_started.take().map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        if let Some(inst) = &self.inst {
+            if !inst.visible {
+                let _ = inst.webview.set_visible(false);
+                if self.settings.low_memory {
+                    set_memory_low(&inst.webview, true);
+                }
+            }
+        }
+        let msg = format!("render tersembunyi selesai setelah {secs} dtk ({why})");
+        self.log(&msg);
+        self.diag_note(&msg);
     }
 
     /// Selesaikan "Cek email sekarang" memakai angka terakhir yang diketahui, bila ada.
@@ -1647,6 +1706,7 @@ impl App {
             "s": self.settings,
             "mailto": win::mailto_registered(),
             "update": self.update_ready,
+            "update_msg": self.update_msg,
             "restart": self.restart_needed(),
         });
         let _ = w
@@ -1951,6 +2011,10 @@ impl App {
         if !idle {
             return;
         }
+        // Sedang menggambar Outlook tersembunyi (render hangat): jangan dirapikan dulu.
+        if self.warm_until.is_some() {
+            return;
+        }
 
         // Mode efisiensi (EcoQoS, prioritas rendah) selama tersembunyi/diminimalkan. Diterapkan
         // ulang tiap pemeriksaan supaya proses WebView2 baru (setelah segarkan) ikut.
@@ -2188,7 +2252,28 @@ impl App {
                 self.inspect_sent = true;
             }
         }
-        if unread < 0 && force && self.manual_check {
+        let hidden_now = self.inst.as_ref().is_some_and(|i| !i.visible);
+        if unread < 0 && force && self.manual_check && hidden_now && !self.manual_warm_tried {
+            // Di tray: halaman belum digambar. Gambar dulu (jendela tetap tersembunyi),
+            // pastikan di halaman Email, lalu baca lagi.
+            self.manual_warm_tried = true;
+            self.log("cek email: Inbox belum terbaca di tray, menggambar halaman dulu");
+            self.diag_note("cek email: render tersembunyi");
+            let on_mail = self
+                .inst
+                .as_ref()
+                .is_some_and(|i| i.webview.url().is_ok_and(|u| is_outlook_mail_url(&u)));
+            if !on_mail {
+                if let Some(inst) = &self.inst {
+                    let _ = inst.webview.load_url(MAIL_URL);
+                }
+                self.settle_until = Some(Instant::now() + REFRESH_SETTLE);
+            }
+            self.start_warm("cek email");
+            self.force_read();
+            self.manual_reloaded = true; // jangan muat ulang lagi saat menunggu
+            self.bg_deadline = Some(Instant::now() + MANUAL_WARM_WAIT);
+        } else if unread < 0 && force && self.manual_check {
             // Halaman menjawab, tapi panel folder tidak terbaca (mis. jendela terlalu sempit,
             // atau halaman Outlook belum selesai dimuat).
             self.log(&format!("cek email: halaman menjawab tapi Inbox tidak terbaca ({})", self.unread_how));
@@ -2206,6 +2291,7 @@ impl App {
             }
         }
         if unread >= 0 {
+            self.end_warm("Inbox terbaca");
             let prev = self.unread;
             self.unread = Some(unread);
             self.note_count(prev, unread);
@@ -2238,6 +2324,9 @@ impl App {
         ));
         if is_outlook_url(&url) {
             self.login_seen_at = None; // status login dibersihkan saat pemantau melapor
+            if hidden && self.warm_until.is_none() {
+                self.start_warm("dimuat saat tersembunyi");
+            }
             return;
         }
         // Di jendela terlihat, halaman lain bisa saja pintasan (To Do, intranet).
@@ -2326,6 +2415,10 @@ impl App {
         }
         self.update_running = true;
         self.last_update_check = Some(Instant::now());
+        if manual {
+            self.update_msg = Some("Memeriksa update…".into());
+            self.push_settings_state();
+        }
         let proxy = self.proxy.clone();
         let dir = self.dir.clone();
         std::thread::spawn(move || {
@@ -2345,10 +2438,15 @@ impl App {
                     None,
                     Some(false),
                 );
+                self.update_msg = Some(format!("Versi baru v{v} siap. Tekan \"Pakai sekarang\" di atas."));
                 self.update_ready = Some(v);
             }
             update::Outcome::UpToDate => {
                 if manual {
+                    self.update_msg = Some(format!(
+                        "Tidak ada update. v{VERSION} sudah terbaru (dicek {}).",
+                        Local::now().format("%H:%M")
+                    ));
                     self.toast(
                         "Outlook Lite",
                         &format!("Sudah versi terbaru (v{VERSION})."),
@@ -2360,11 +2458,13 @@ impl App {
             update::Outcome::Failed(e) => {
                 self.log(&format!("cek update gagal: {e}"));
                 if manual {
+                    self.update_msg = Some(format!("Cek update gagal: {e}"));
                     self.toast("Cek update gagal", &e, None, Some(false));
                 }
             }
         }
         self.sync_menu();
+        self.push_settings_state();
     }
 
     fn restart(&mut self) {
@@ -2437,6 +2537,9 @@ impl App {
                     .webview
                     .evaluate_script("window.__oliteForce && window.__oliteForce()");
             }
+        }
+        if self.warm_until.is_some_and(|t| now >= t) {
+            self.end_warm("batas waktu, Inbox belum terbaca");
         }
         self.flush_mail_alert();
         self.net_tick(target, now);
@@ -3007,6 +3110,10 @@ fn main() {
         last_mode: Mode::Jeda,
         bg_deadline: None,
         manual_reloaded: false,
+        manual_warm_tried: false,
+        warm_until: None,
+        warm_started: None,
+        update_msg: None,
         manual_check: false,
         inspect_pending: false,
         inspect_sent: false,
