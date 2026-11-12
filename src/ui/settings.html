@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<title>Pengaturan Outlook Lite</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #5d6675; --line: #e3e6eb;
+    --accent: #0f6cbd; --accent-text: #ffffff; --warn-bg: #fff4ce; --warn-text: #5c4300;
+    --switch-off: #c4c9d1; --chip: #eef1f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1c1d21; --card: #26282d; --text: #e9ebef; --muted: #a3a9b4; --line: #363940;
+      --accent: #4ca0e8; --accent-text: #0b1520; --warn-bg: #4a3d12; --warn-text: #ffe8a3;
+      --switch-off: #50545c; --chip: #31343a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; }
+  body { padding: 12px 12px 20px; }
+  header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  header .logo { width: 32px; height: 32px; border-radius: 8px; background: var(--accent);
+    color: var(--accent-text); display: grid; place-items: center; font-weight: 700; font-size: 15px; }
+  header h1 { font-size: 15px; margin: 0; }
+  header .status { color: var(--muted); font-size: 12px; }
+  .banner { display: none; background: var(--warn-bg); color: var(--warn-text); border-radius: 8px;
+    padding: 8px 10px; margin-bottom: 10px; align-items: center; gap: 8px; }
+  .banner.on { display: flex; }
+  .banner span { flex: 1; }
+  .quick { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 10px; }
+  button { font: inherit; color: var(--text); background: var(--card); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  button.danger { color: #c42b1c; }
+  details { background: var(--card); border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px; }
+  summary { padding: 9px 12px; font-weight: 600; cursor: pointer; list-style: none; display: flex;
+    justify-content: space-between; }
+  summary::after { content: "›"; color: var(--muted); transition: transform .15s; }
+  details[open] summary::after { transform: rotate(90deg); }
+  .rows { padding: 0 12px 8px; }
+  .row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-top: 1px solid var(--line); }
+  .row:first-child { border-top: 0; }
+  .row .label { flex: 1; min-width: 0; }
+  .row .hint { display: block; color: var(--muted); font-size: 11.5px; }
+  .tag { font-size: 10.5px; border-radius: 4px; padding: 0 5px; margin-left: 4px; background: var(--chip);
+    color: var(--muted); white-space: nowrap; }
+  input[type=number] { width: 72px; } input[type=time] { width: 116px; }
+  input[type=number], input[type=time], input[type=text] { font: inherit; color: var(--text);
+    background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 4px 6px; }
+  input[type=text] { width: 100%; }
+  .switch { position: relative; width: 36px; height: 20px; flex: none; }
+  .switch input { opacity: 0; width: 100%; height: 100%; margin: 0; position: absolute; cursor: pointer; z-index: 1; }
+  .switch span { position: absolute; inset: 0; border-radius: 10px; background: var(--switch-off); }
+  body.ready .switch span, body.ready .switch span::after { transition: background .15s, transform .15s; }
+  .switch span::after { content: ""; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px;
+    border-radius: 50%; background: #fff; }
+  .switch input:checked + span { background: var(--accent); }
+  .switch input:checked + span::after { transform: translateX(16px); }
+  .switch input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .days { display: flex; gap: 4px; flex-wrap: wrap; }
+  .days label { background: var(--chip); border-radius: 5px; padding: 3px 7px; cursor: pointer; user-select: none; }
+  .days input { display: none; }
+  .days input:checked + b { color: var(--accent); }
+  .days b { font-weight: 600; }
+  .btns { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 0 4px; }
+  .sc { display: grid; grid-template-columns: 1fr 1.6fr auto auto; gap: 6px; padding: 6px 0; align-items: center; }
+  .muted { color: var(--muted); }
+  footer { display: flex; gap: 6px; justify-content: space-between; margin-top: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">O</div>
+  <div><h1>Outlook Lite <span id="ver" class="muted"></span></h1><div class="status" id="status">Memuat…</div></div>
+</header>
+
+<div class="banner" id="restartBanner"><span>Beberapa perubahan baru berlaku setelah aplikasi dimulai ulang.</span>
+  <button class="primary" data-act="restart">Restart sekarang</button></div>
+<div class="banner" id="updateBanner"><span id="updateText">Versi baru siap.</span>
+  <button class="primary" data-menu="restart_update">Pakai sekarang</button></div>
+
+<div class="quick">
+  <button data-menu="open_mail">Buka Email</button>
+  <button data-menu="open_cal">Buka Kalender</button>
+  <button data-menu="compose">Email baru</button>
+  <button data-menu="check_now">Cek email sekarang</button>
+</div>
+<div class="quick" id="quickShortcuts"></div>
+
+<details open>
+  <summary>Notifikasi</summary>
+  <div class="rows">
+    <div class="row"><div class="label">Hanya jam kerja<span class="hint">Di luar jam ini pemantauan berhenti dan Outlook tersembunyi ditutup.</span></div>
+      <label class="switch"><input type="checkbox" data-key="work_hours_only"><span></span></label></div>
+    <div class="row"><div class="label">Jam kerja</div>
+      <input type="time" data-key="work_start"> – <input type="time" data-key="work_end"></div>
+    <div class="row" style="display:block"><div class="label" style="margin-bottom:6px">Hari kerja</div>
+      <div class="days" id="days"></div></div>
+    <div class="row"><div class="label">Bunyi notifikasi</div>
+      <label class="switch"><input type="checkbox" data-key="sound"><span></span></label></div>
+    <div class="row"><div class="label">Tampilkan pengirim &amp; subjek<span class="hint">Mati = hanya jumlah email baru (lebih privat).</span></div>
+      <label class="switch"><input type="checkbox" data-key="show_details"><span></span></label></div>
+    <div class="row"><div class="label">Mode kompatibel<span class="hint">Pakai bila notifikasi Windows tidak muncul.</span></div>
+      <label class="switch"><input type="checkbox" data-key="toast_compat"><span></span></label></div>
+    <div class="btns"><button data-menu="test_toast">Tes notifikasi</button></div>
+  </div>
+</details>
+
+<details>
+  <summary>Jendela</summary>
+  <div class="rows">
+    <div class="row"><div class="label">Tutup otomatis saat tidak dipakai<span class="hint">Tidak berlaku saat menulis email.</span></div>
+      <label class="switch"><input type="checkbox" data-key="auto_close"><span></span></label></div>
+    <div class="row"><div class="label">Setelah (menit)</div><input type="number" min="1" max="240" data-key="auto_close_min"></div>
+    <div class="row"><div class="label">Ukuran tampilan <b id="zoomPct"></b></div>
+      <button data-menu="zoom_out">−</button><button data-menu="zoom_reset">100%</button><button data-menu="zoom_in">+</button></div>
+    <div class="row"><div class="label">Tampilan mobile di tray<span class="tag">eksperimen</span><span class="hint">Mungkin lebih ringan; membuka jendela jadi beberapa detik lebih lama.</span></div>
+      <label class="switch"><input type="checkbox" data-key="tray_mobile_ui"><span></span></label></div>
+  </div>
+</details>
+
+<details>
+  <summary>Hemat RAM</summary>
+  <div class="rows">
+    <div class="row"><div class="label">Hemat RAM saat tersembunyi<span class="hint">Memori rendah, rapikan RAM, segarkan bila membengkak.</span></div>
+      <label class="switch"><input type="checkbox" data-key="low_memory"><span></span></label></div>
+    <div class="row"><div class="label">Mode efisiensi Windows<span class="hint">Prioritas CPU &amp; memori rendah saat di tray/minimize.</span></div>
+      <label class="switch"><input type="checkbox" data-key="efficiency_mode"><span></span></label></div>
+    <div class="row"><div class="label">Rapikan bila RAM lebih dari (MB)<span class="hint">0 = hanya berkala tiap 5 menit.</span></div><input type="number" min="0" max="2000" data-key="trim_ws_mb"></div>
+    <div class="row"><div class="label">Segarkan Outlook bila RAM naik lagi di atas (MB)</div><input type="number" min="0" max="8000" data-key="refresh_ws_mb"></div>
+    <div class="row"><div class="label">Segarkan bila commit di atas (MB)</div><input type="number" min="0" max="8000" data-key="refresh_mb"></div>
+    <div class="row"><div class="label">Segarkan paling lambat tiap (jam)</div><input type="number" min="0" max="72" data-key="refresh_hours"></div>
+    <div class="row"><div class="label">Tanpa service worker Outlook<span class="hint">Satu proses lebih sedikit (~30–45 MB).</span></div>
+      <label class="switch"><input type="checkbox" data-key="block_service_worker" data-menu="no_sw"><span></span></label></div>
+    <div class="row"><div class="label">Tanpa GPU<span class="tag">restart</span><span class="hint">Hemat 50–80 MB; gulir sedikit kurang halus.</span></div>
+      <label class="switch"><input type="checkbox" data-key="no_gpu"><span></span></label></div>
+    <div class="row"><div class="label">Mode RAM kecil Chromium<span class="tag">restart</span></div>
+      <label class="switch"><input type="checkbox" data-key="low_end_mode"><span></span></label></div>
+    <div class="row"><div class="label">JavaScript hemat memori (V8)<span class="tag">restart</span></div>
+      <label class="switch"><input type="checkbox" data-key="v8_optimize_for_size"><span></span></label></div>
+    <div class="row"><div class="label">Bersih-bersih memori saat tidak aktif<span class="tag">restart</span><span class="hint">Fitur WebView2 sendiri.</span></div>
+      <label class="switch"><input type="checkbox" data-key="simulate_memory_pressure"><span></span></label></div>
+  </div>
+</details>
+
+<details>
+  <summary>Privasi &amp; WebView2</summary>
+  <div class="rows">
+    <div class="row"><div class="label">Blokir telemetri Outlook/Office</div>
+      <label class="switch"><input type="checkbox" data-key="block_telemetry"><span></span></label></div>
+    <div class="row"><div class="label">Tracking prevention<span class="tag">restart</span><span class="hint">Mati = lebih ringan; aman karena hanya memuat Outlook.</span></div>
+      <label class="switch"><input type="checkbox" data-key="tracking_prevention"><span></span></label></div>
+    <div class="row"><div class="label">Laporan crash disimpan lokal<span class="tag">restart</span><span class="hint">Tidak dikirim ke Microsoft.</span></div>
+      <label class="switch"><input type="checkbox" data-key="local_crash_reports"><span></span></label></div>
+    <div class="row"><div class="label">WebView2 disiapkan sendiri<span class="tag">restart</span><span class="hint">Matikan bila Outlook tidak mau terbuka setelah update.</span></div>
+      <label class="switch"><input type="checkbox" data-key="custom_environment"><span></span></label></div>
+    <div class="row"><div class="label">Proxy lewat Windows<span class="tag">restart</span><span class="hint">Membantu jaringan kantor saat PC baru menyala.</span></div>
+      <label class="switch"><input type="checkbox" data-key="system_proxy_resolver"><span></span></label></div>
+    <div class="row"><div class="label">Isolasi situs<span class="tag">restart</span><span class="hint">Nyala = lebih banyak proses &amp; RAM.</span></div>
+      <label class="switch"><input type="checkbox" data-key="site_isolation"><span></span></label></div>
+    <div class="row" style="display:block"><div class="label">Argumen WebView2 tambahan<span class="tag">restart</span></div>
+      <input type="text" data-key="extra_browser_args" placeholder="kosong" spellcheck="false"></div>
+  </div>
+</details>
+
+<details>
+  <summary>Aplikasi</summary>
+  <div class="rows">
+    <div class="row"><div class="label">Mulai dengan Windows</div>
+      <label class="switch"><input type="checkbox" data-key="autostart" data-menu="autostart"><span></span></label></div>
+    <div class="row"><div class="label">Hotkey</div>
+      <label class="switch"><input type="checkbox" data-key="hotkeys" data-menu="hotkeys"><span></span></label></div>
+    <div class="row"><div class="label">Buka/tutup jendela</div><input type="text" style="width:150px" data-key="hotkey_toggle" spellcheck="false"></div>
+    <div class="row"><div class="label">Email baru</div><input type="text" style="width:150px" data-key="hotkey_compose" spellcheck="false"></div>
+    <div class="row"><div class="label">Aplikasi email default (mailto)<span class="hint">Tautan email membuka layar tulis Outlook.</span></div>
+      <label class="switch"><input type="checkbox" data-state="mailto" data-menu="mailto"><span></span></label></div>
+    <div class="row"><div class="label">Update otomatis</div>
+      <label class="switch"><input type="checkbox" data-key="auto_update"><span></span></label></div>
+    <div class="btns"><button data-menu="check_update">Cek update sekarang</button></div>
+  </div>
+</details>
+
+<details>
+  <summary>Pintasan</summary>
+  <div class="rows">
+    <div id="scList"></div>
+    <div class="sc"><input type="text" id="scName" placeholder="Nama"><input type="text" id="scUrl" placeholder="https://…" spellcheck="false">
+      <button id="scAdd" style="grid-column: span 2">Tambah</button></div>
+    <div class="hint muted">Hanya alamat Microsoft yang dibuka di dalam aplikasi; alamat lain dibuka di browser.</div>
+  </div>
+</details>
+
+<details>
+  <summary>Diagnostik</summary>
+  <div class="rows">
+    <div class="row"><div class="label">Catat diagnostik<span class="hint">RAM &amp; CPU tiap 30 detik, domain, kejadian. Tanpa isi email.</span></div>
+      <label class="switch"><input type="checkbox" data-key="diagnostics" data-menu="diag_ram"><span></span></label></div>
+    <div class="btns">
+      <button data-menu="diag_report">Buat laporan diagnostik</button>
+      <button data-menu="inspect">Diagnostik halaman Outlook</button>
+    </div>
+    <div class="row" style="display:block"><div class="label">Selector jumlah belum dibaca<span class="tag">lanjutan</span><span class="hint">Kosongkan untuk otomatis.</span></div>
+      <input type="text" data-key="unread_selector" placeholder="otomatis" spellcheck="false"></div>
+    <div class="btns">
+      <button data-menu="open_folder">Folder pengaturan</button>
+      <button data-menu="open_app_folder">Folder aplikasi</button>
+      <button data-menu="reload">Muat ulang pengaturan</button>
+    </div>
+  </div>
+</details>
+
+<footer>
+  <button class="danger" data-menu="uninstall">Hapus instalasi…</button>
+  <span>
+    <button data-menu="close_window">Tutup jendela Outlook</button>
+    <button data-menu="quit">Keluar</button>
+  </span>
+</footer>
+
+<script>
+(() => {
+  const send = (o) => { try { window.ipc.postMessage(JSON.stringify(o)); } catch (e) {} };
+  const $ = (s) => document.querySelector(s);
+  const DAYS = [[1, 'Sen'], [2, 'Sel'], [3, 'Rab'], [4, 'Kam'], [5, 'Jum'], [6, 'Sab'], [7, 'Min']];
+  let state = null;
+
+  $('#days').innerHTML = DAYS.map(([n, t]) =>
+    `<label><input type="checkbox" value="${n}"><b>${t}</b></label>`).join('');
+  $('#days').addEventListener('change', () => {
+    const v = [...document.querySelectorAll('#days input:checked')].map((i) => +i.value);
+    send({ t: 'set', key: 'work_days', value: v });
+  });
+
+  // Tombol aksi: data-menu = id menu aplikasi.
+  document.addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-menu], button[data-act]');
+    if (!b) return;
+    if (b.dataset.act === 'restart') send({ t: 'restart' });
+    else send({ t: 'menu', id: b.dataset.menu });
+  });
+
+  // Isian & saklar.
+  document.addEventListener('change', (e) => {
+    const el = e.target;
+    if (el.dataset.menu && el.type === 'checkbox') { send({ t: 'menu', id: el.dataset.menu }); return; }
+    const key = el.dataset.key;
+    if (!key) return;
+    let value;
+    if (el.type === 'checkbox') value = el.checked;
+    else if (el.type === 'number') { value = el.value === '' ? 0 : Math.round(+el.value); }
+    else if (key === 'unread_selector') value = el.value.trim() || null;
+    else value = el.value;
+    send({ t: 'set', key, value });
+  });
+
+  // Pintasan
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  function saveShortcuts(list) { send({ t: 'shortcuts', list }); }
+  $('#scAdd').addEventListener('click', () => {
+    const name = $('#scName').value.trim();
+    let url = $('#scUrl').value.trim();
+    if (!name || !url) return;
+    if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+    saveShortcuts([...(state ? state.s.shortcuts : []), { name, url }]);
+    $('#scName').value = ''; $('#scUrl').value = '';
+  });
+  $('#scList').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-del]');
+    if (!b || !state) return;
+    const list = state.s.shortcuts.filter((_, i) => i !== +b.dataset.del);
+    saveShortcuts(list);
+  });
+
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') send({ t: 'close' }); });
+
+  window.__olite = {
+    render(st) {
+      state = st;
+      const s = st.s;
+      $('#ver').textContent = 'v' + st.version;
+      $('#status').textContent = st.status;
+      $('#restartBanner').classList.toggle('on', !!st.restart);
+      $('#updateBanner').classList.toggle('on', !!st.update);
+      if (st.update) $('#updateText').textContent = 'Versi baru v' + st.update + ' siap dipakai.';
+      $('#zoomPct').textContent = Math.round(s.zoom * 100) + '%';
+      for (const el of document.querySelectorAll('[data-key], [data-state]')) {
+        if (el === document.activeElement && el.type !== 'checkbox') continue; // jangan timpa yang sedang diketik
+        const v = el.dataset.state ? st[el.dataset.state] : s[el.dataset.key];
+        if (el.type === 'checkbox') el.checked = !!v;
+        else el.value = v == null ? '' : v;
+      }
+      for (const i of document.querySelectorAll('#days input')) i.checked = s.work_days.includes(+i.value);
+      $('#quickShortcuts').innerHTML = s.shortcuts.map((sc, i) =>
+        `<button data-menu="shortcut:${i}">${esc(sc.name)}</button>`).join('');
+      $('#scList').innerHTML = s.shortcuts.length ? s.shortcuts.map((sc, i) =>
+        `<div class="sc"><span>${esc(sc.name)}</span><span class="muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(sc.url)}</span>` +
+        `<button data-menu="shortcut:${i}">Buka</button><button data-del="${i}">Hapus</button></div>`).join('')
+        : '<div class="muted" style="padding:6px 0">Belum ada pintasan.</div>';
+      // Animasi saklar baru aktif setelah tampilan pertama terisi.
+      setTimeout(() => document.body.classList.add('ready'), 50);
+    },
+  };
+  send({ t: 'ready' });
+})();
+</script>
+</body>
+</html>

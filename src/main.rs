@@ -39,7 +39,7 @@ use tao::{
     window::{Icon as WindowIcon, Window, WindowBuilder, WindowId},
 };
 use tray_icon::{
-    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
     Icon as TrayImage, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 use wry::{NewWindowResponse, PageLoadEvent, WebContext, WebView, WebViewBuilder};
@@ -51,6 +51,7 @@ use urlutil::{
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const SETTINGS_HTML: &str = include_str!("ui/settings.html");
 /// Ada selama aplikasi berjalan; tersisa saat start berikutnya = sesi lalu berhenti tidak normal.
 const SESSION_MARKER: &str = "sesi-berjalan.txt";
 const INSTANCE_PORT: u16 = 47193;
@@ -125,6 +126,8 @@ enum UserEvent {
     ProcessFailed(i32),
     /// Navigasi halaman utama selesai (berhasil, status error WebView2).
     NavDone(bool, i32),
+    /// Pesan dari jendela Pengaturan.
+    SettingsUi(String),
 }
 
 enum RemoteCmd {
@@ -397,6 +400,19 @@ fn browser_args_for(s: &Settings, started_in_tray: bool) -> String {
     format!("--disable-features={features} {AUTOPLAY_ARGS} {BG_ARGS}{extra}")
 }
 
+/// Argumen WebView2 lengkap (termasuk GPU & argumen tambahan) untuk pengaturan `s`.
+fn full_browser_args(s: &Settings, started_in_tray: bool) -> String {
+    let mut a = browser_args_for(s, started_in_tray);
+    if s.no_gpu {
+        a.push_str(" --disable-gpu");
+    }
+    if !s.extra_browser_args.trim().is_empty() {
+        a.push(' ');
+        a.push_str(s.extra_browser_args.trim());
+    }
+    a
+}
+
 fn data_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -480,105 +496,21 @@ mod id {
     pub const RESTART_UPDATE: &str = "restart_update";
     pub const CLOSE_WINDOW: &str = "close_window";
     pub const QUIT: &str = "quit";
+    pub const SETTINGS: &str = "settings";
 }
 
 struct TrayMenu {
     status: MenuItem,
-    work_hours: CheckMenuItem,
-    sound: CheckMenuItem,
-    details: CheckMenuItem,
-    toast_compat: CheckMenuItem,
-    auto_close: CheckMenuItem,
-    low_mem: CheckMenuItem,
-    no_gpu: CheckMenuItem,
-    no_sw: CheckMenuItem,
-    autostart: CheckMenuItem,
-    hotkeys: CheckMenuItem,
-    mailto: CheckMenuItem,
-    auto_update: CheckMenuItem,
-    diag: CheckMenuItem,
     restart_update: MenuItem,
 }
 
+/// Menu tray ringkas; semua pengaturan ada di jendela Pengaturan.
 fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> {
-    let check = |i: &str, t: &str, c: bool| CheckMenuItem::with_id(i, t, true, c, None);
     let item = |i: &str, t: &str| MenuItem::with_id(i, t, true, None);
     let sep = PredefinedMenuItem::separator;
 
     let status = MenuItem::with_id("status", "Outlook Lite", false, None);
-    let work_hours = check(
-        id::WORK_HOURS,
-        &format!("Hanya jam kerja ({})", s.work_hours_label()),
-        false,
-    );
-    let sound = check(id::SOUND, "Bunyi notifikasi", false);
-    let details = check(id::DETAILS, "Tampilkan pengirim && subjek", false);
-    let toast_compat = check(
-        id::TOAST_COMPAT,
-        "Mode kompatibel (jika notifikasi tidak muncul)",
-        false,
-    );
-    let auto_close = check(
-        id::AUTO_CLOSE,
-        &format!("Tutup otomatis saat tidak aktif ({} menit)", s.auto_close_min),
-        false,
-    );
-    let low_mem = check(id::LOW_MEM, "Hemat RAM (rapikan memori saat tersembunyi)", false);
-    let no_gpu = check(id::NO_GPU, "Tanpa GPU (hemat RAM, berlaku setelah restart)", false);
-    let no_sw = check(id::NO_SW, "Tanpa service worker Outlook (hemat RAM)", false);
-    let autostart = check(id::AUTOSTART, "Mulai dengan Windows", false);
-    let hotkeys = check(id::HOTKEYS, &hotkey_label(s), false);
-    let mailto = check(id::MAILTO, "Aplikasi email default (mailto)", false);
-    let auto_update = check(id::AUTO_UPDATE, "Update otomatis", false);
-    let diag = check(id::DIAG_RAM, "Catat diagnostik (RAM && CPU tiap 30 detik)", false);
     let restart_update = MenuItem::with_id(id::RESTART_UPDATE, "Tidak ada update", false, None);
-
-    let notif = Submenu::with_items(
-        "Notifikasi",
-        true,
-        &[
-            &work_hours,
-            &sound,
-            &details,
-            &sep(),
-            &item(id::TEST_TOAST, "Tes notifikasi"),
-            &toast_compat,
-        ],
-    )?;
-    let window = Submenu::with_items(
-        "Jendela",
-        true,
-        &[
-            &auto_close,
-            &low_mem,
-            &no_gpu,
-            &no_sw,
-            &sep(),
-            &item(id::ZOOM_IN, "Perbesar tampilan"),
-            &item(id::ZOOM_OUT, "Perkecil tampilan"),
-            &item(id::ZOOM_RESET, "Ukuran tampilan 100%"),
-        ],
-    )?;
-    let prefs = Submenu::with_items(
-        "Pengaturan",
-        true,
-        &[
-            &autostart,
-            &hotkeys,
-            &mailto,
-            &auto_update,
-            &item(id::CHECK_UPDATE, "Cek update sekarang"),
-            &diag,
-            &sep(),
-            &item(id::DIAG_REPORT, "Buat laporan diagnostik (untuk dikirim)"),
-            &item(id::INSPECT, "Diagnostik halaman Outlook"),
-            &item(id::OPEN_FOLDER, "Buka folder pengaturan"),
-            &item(id::OPEN_APP_FOLDER, "Buka folder aplikasi"),
-            &item(id::RELOAD, "Muat ulang pengaturan"),
-            &item(id::UNINSTALL, "Hapus instalasi…"),
-            &MenuItem::new(format!("Outlook Lite v{VERSION}"), false, None),
-        ],
-    )?;
 
     let shortcut_items: Vec<MenuItem> = s
         .shortcuts
@@ -601,35 +533,14 @@ fn build_menu(s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error> 
         &shortcuts,
         &item(id::CHECK_NOW, "Cek email sekarang"),
         &sep(),
-        &notif,
-        &window,
-        &prefs,
+        &item(id::SETTINGS, "Pengaturan…"),
         &sep(),
         &restart_update,
         &item(id::CLOSE_WINDOW, "Tutup jendela"),
         &item(id::QUIT, "Keluar"),
     ])?;
 
-    Ok((
-        menu,
-        TrayMenu {
-            status,
-            work_hours,
-            sound,
-            details,
-            toast_compat,
-            auto_close,
-            low_mem,
-            no_gpu,
-            no_sw,
-            autostart,
-            hotkeys,
-            mailto,
-            auto_update,
-            diag,
-            restart_update,
-        },
-    ))
+    Ok((menu, TrayMenu { status, restart_update }))
 }
 
 /// Kombinasi cadangan bila hotkey bawaan sudah dipakai aplikasi lain.
@@ -645,6 +556,32 @@ fn hotkey_label(s: &Settings) -> String {
 
 // ---------------------------------------------------------------------------
 // Aplikasi
+
+/// Jendela Pengaturan (WebView2 kecil berisi settings.html). Dihancurkan saat ditutup.
+struct SettingsWin {
+    window: Window,
+    webview: WebView,
+}
+
+/// Opsi environment WebView2 saat aplikasi mulai. Semua WebView dalam satu sesi memakai opsi
+/// yang sama (WebView2 menolak opsi berbeda selama prosesnya berjalan); perubahan berlaku
+/// setelah restart.
+#[derive(Clone, Copy, PartialEq)]
+struct EnvOpts {
+    custom: bool,
+    tracking_prevention: bool,
+    local_crash_reports: bool,
+}
+
+impl EnvOpts {
+    fn of(s: &Settings) -> Self {
+        Self {
+            custom: s.custom_environment,
+            tracking_prevention: s.tracking_prevention,
+            local_crash_reports: s.local_crash_reports,
+        }
+    }
+}
 
 struct Instance {
     window: Window,
@@ -720,6 +657,9 @@ struct App {
     background_mode: bool,
     net: netrecover::NetRecovery,
     env_logged: bool,
+    env_opts: EnvOpts,
+    started_tray: bool,
+    settings_win: Option<SettingsWin>,
     /// Jendela dibuka dari tray/minimize: kapan, dan dari mana (untuk mengukur waktu buka).
     restore_started: Option<(Instant, &'static str)>,
     /// WebView2 dibuat ulang pada waktu ini (jendela terlihat?), setelah proses lama selesai.
@@ -826,6 +766,7 @@ impl App {
         }
         self.badge = badge;
         self.last_tip = tip;
+        self.push_settings_state();
         let has_unread = self.shown_unread().unwrap_or(0) > 0;
         if let Some(i) = &self.inst {
             // Tanda merah di ikon taskbar, seperti PWA Outlook.
@@ -855,20 +796,6 @@ impl App {
 
     fn sync_menu(&self) {
         let Some(m) = &self.menu else { return };
-        let s = &self.settings;
-        m.work_hours.set_checked(s.work_hours_only);
-        m.sound.set_checked(s.sound);
-        m.details.set_checked(s.show_details);
-        m.toast_compat.set_checked(s.toast_compat);
-        m.auto_close.set_checked(s.auto_close);
-        m.low_mem.set_checked(s.low_memory);
-        m.no_gpu.set_checked(s.no_gpu);
-        m.no_sw.set_checked(s.block_service_worker);
-        m.autostart.set_checked(s.autostart);
-        m.hotkeys.set_checked(s.hotkeys);
-        m.mailto.set_checked(win::mailto_registered());
-        m.auto_update.set_checked(s.auto_update);
-        m.diag.set_checked(s.diagnostics);
         match &self.update_ready {
             Some(v) => {
                 m.restart_update
@@ -996,9 +923,6 @@ impl App {
             self.settings.hotkey_warned.clear();
             // Simpan segera supaya pemberitahuan ini tidak muncul lagi di start berikutnya.
             self.save();
-            if let Some(menu) = &self.menu {
-                menu.hotkeys.set_text(hotkey_label(&self.settings));
-            }
             self.toast(
                 "Hotkey diganti otomatis",
                 &format!("Kombinasi lama sudah dipakai aplikasi lain. Sekarang: {msg}."),
@@ -1086,32 +1010,7 @@ impl App {
         let args = self.browser_args.clone();
         // Environment WebView2 sendiri (dibuat sebelum builder meminjam web_context).
         #[cfg(windows)]
-        let custom_env = if self.settings.custom_environment {
-            match win::create_environment(
-                &self.dir.join("WebView2"),
-                &args,
-                self.settings.tracking_prevention,
-                self.settings.local_crash_reports,
-            ) {
-                Ok(env) => Some(env),
-                Err(e) => {
-                    // Cadangan: cara lama (environment dibuat wry). Outlook tetap jalan.
-                    self.log(&format!("environment WebView2 sendiri gagal, pakai cara lama: {e}"));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        #[cfg(windows)]
-        if !self.env_logged {
-            self.env_logged = true;
-            self.log(if custom_env.is_some() {
-                "WebView2: environment sendiri (tracking prevention mati, crash disimpan lokal)"
-            } else {
-                "WebView2: environment bawaan"
-            });
-        }
+        let custom_env = self.webview_env();
         let proxy_ipc = self.proxy.clone();
         let proxy_load = self.proxy.clone();
         let mobile = !visible && self.settings.tray_mobile_ui;
@@ -1568,6 +1467,208 @@ impl App {
         if let Some(t) = self.net.next_at() {
             self.next_tick = self.next_tick.min(t);
         }
+    }
+
+    /// Environment WebView2 dengan opsi resmi (lihat EnvOpts), atau None = environment bawaan wry.
+    #[cfg(windows)]
+    fn webview_env(
+        &mut self,
+    ) -> Option<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment> {
+        let o = self.env_opts;
+        let env = if o.custom {
+            match win::create_environment(
+                &self.dir.join("WebView2"),
+                &self.browser_args,
+                o.tracking_prevention,
+                o.local_crash_reports,
+            ) {
+                Ok(env) => Some(env),
+                Err(e) => {
+                    // Cadangan: cara lama (environment dibuat wry). Outlook tetap jalan.
+                    self.log(&format!("environment WebView2 sendiri gagal, pakai cara lama: {e}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if !self.env_logged {
+            self.env_logged = true;
+            self.log(if env.is_some() {
+                "WebView2: environment sendiri (tracking prevention mati, crash disimpan lokal)"
+            } else {
+                "WebView2: environment bawaan"
+            });
+        }
+        env
+    }
+
+    // ----- jendela Pengaturan -----
+
+    fn open_settings(&mut self, target: &EventLoopWindowTarget<UserEvent>) {
+        if let Some(w) = &self.settings_win {
+            w.window.set_visible(true);
+            w.window.set_minimized(false);
+            w.window.set_focus();
+            return;
+        }
+        let size = LogicalSize::new(400.0, 680.0);
+        let mut wb = WindowBuilder::new()
+            .with_title("Pengaturan Outlook Lite")
+            .with_window_icon(window_image())
+            .with_inner_size(size)
+            .with_min_inner_size(LogicalSize::new(360.0, 420.0));
+        // Di pojok kanan bawah, dekat ikon tray.
+        if let Some(m) = target.primary_monitor() {
+            let sf = m.scale_factor();
+            let ms = m.size();
+            let mp = m.position();
+            let w = (size.width * sf) as i32;
+            let h = (size.height * sf) as i32;
+            let x = mp.x + ms.width as i32 - w - (16.0 * sf) as i32;
+            let y = mp.y + ms.height as i32 - h - (64.0 * sf) as i32;
+            wb = wb.with_position(PhysicalPosition::new(x.max(mp.x), y.max(mp.y)));
+        }
+        let window = match wb.build(target) {
+            Ok(w) => w,
+            Err(e) => {
+                self.log(&format!("jendela pengaturan gagal: {e}"));
+                return;
+            }
+        };
+        #[cfg(windows)]
+        let env = self.webview_env();
+        #[cfg(windows)]
+        let args = self.browser_args.clone();
+        let proxy = self.proxy.clone();
+        let builder = WebViewBuilder::new_with_web_context(&mut self.web_context)
+            .with_html(SETTINGS_HTML)
+            .with_ipc_handler(move |req: wry::http::Request<String>| {
+                let _ = proxy.send_event(UserEvent::SettingsUi(req.body().clone()));
+            })
+            // Halaman lokal saja: tidak ada navigasi atau jendela baru ke internet.
+            .with_navigation_handler(|url: String| {
+                !(url.starts_with("http:") || url.starts_with("https:"))
+            })
+            .with_new_window_req_handler(|_url: String, _features| wry::NewWindowResponse::Deny);
+        #[cfg(windows)]
+        let builder = {
+            use wry::WebViewBuilderExtWindows;
+            match env {
+                Some(env) => builder.with_environment(env),
+                None => builder.with_additional_browser_args(args),
+            }
+        };
+        match builder.build(&window) {
+            Ok(webview) => {
+                self.settings_win = Some(SettingsWin { window, webview });
+            }
+            Err(e) => self.log(&format!("halaman pengaturan gagal: {e}")),
+        }
+    }
+
+    fn close_settings(&mut self) {
+        self.settings_win = None;
+    }
+
+    /// Ada perubahan yang baru berlaku setelah restart?
+    fn restart_needed(&self) -> bool {
+        full_browser_args(&self.settings, self.started_tray) != self.browser_args
+            || EnvOpts::of(&self.settings) != self.env_opts
+    }
+
+    /// Kirim keadaan terbaru ke jendela Pengaturan.
+    fn push_settings_state(&self) {
+        let Some(w) = &self.settings_win else { return };
+        let st = serde_json::json!({
+            "version": VERSION,
+            "status": self.status_text(),
+            "s": self.settings,
+            "mailto": win::mailto_registered(),
+            "update": self.update_ready,
+            "restart": self.restart_needed(),
+        });
+        let _ = w
+            .webview
+            .evaluate_script(&format!("window.__olite && window.__olite.render({st})"));
+    }
+
+    fn on_settings_msg(&mut self, target: &EventLoopWindowTarget<UserEvent>, body: &str) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+            return;
+        };
+        match v.get("t").and_then(|t| t.as_str()).unwrap_or("") {
+            "ready" => {}
+            "menu" => {
+                if let Some(mid) = v.get("id").and_then(|x| x.as_str()) {
+                    let mid = mid.to_string();
+                    if mid == id::SETTINGS {
+                        return;
+                    }
+                    self.on_menu(target, &mid);
+                }
+            }
+            "set" => {
+                if let (Some(key), Some(value)) =
+                    (v.get("key").and_then(|k| k.as_str()), v.get("value"))
+                {
+                    self.apply_setting(target, key, value.clone());
+                }
+            }
+            "shortcuts" => {
+                if let Some(list) = v.get("list") {
+                    self.apply_setting(target, "shortcuts", list.clone());
+                }
+            }
+            "restart" => {
+                self.save();
+                self.restart();
+                return;
+            }
+            "close" => {
+                self.close_settings();
+                return;
+            }
+            _ => return,
+        }
+        self.push_settings_state();
+    }
+
+    /// Ubah satu pengaturan dari jendela Pengaturan, simpan, lalu terapkan efeknya.
+    fn apply_setting(
+        &mut self,
+        target: &EventLoopWindowTarget<UserEvent>,
+        key: &str,
+        value: serde_json::Value,
+    ) {
+        let Ok(mut all) = serde_json::to_value(&self.settings) else {
+            return;
+        };
+        let Some(slot) = all.get_mut(key) else {
+            return;
+        };
+        *slot = value;
+        let Ok(mut new) = serde_json::from_value::<Settings>(all) else {
+            return; // nilai tidak valid: abaikan, tampilan dikembalikan ke nilai lama
+        };
+        new.sanitize();
+        self.settings = new;
+        self.save();
+        match key {
+            "hotkey_toggle" | "hotkey_compose" => self.apply_hotkeys(),
+            "efficiency_mode" | "low_memory"
+                if !(self.settings.efficiency_mode && self.settings.low_memory) =>
+            {
+                self.leave_background_mode()
+            }
+            // Dipasang saat Outlook dibuat: muat ulang Outlook.
+            "block_telemetry" | "unread_selector" => self.recreate_instance(target),
+            "shortcuts" => self.build_tray(),
+            _ => {}
+        }
+        self.tick(target);
+        self.sync_menu();
+        self.refresh_tray();
     }
 
     /// Buat ulang WebView (mis. setelah pengaturan skrip halaman berubah).
@@ -2493,6 +2594,10 @@ impl App {
                 changed = false;
                 self.close_window()
             }
+            id::SETTINGS => {
+                changed = false;
+                self.open_settings(target)
+            }
             id::QUIT => {
                 changed = false;
                 self.quit("menu Keluar")
@@ -2533,6 +2638,13 @@ impl App {
                 if Instant::now() >= self.next_tick {
                     self.tick(target);
                 }
+            }
+            Event::WindowEvent {
+                window_id,
+                event: WindowEvent::CloseRequested,
+                ..
+            } if self.settings_win.as_ref().is_some_and(|w| w.window.id() == window_id) => {
+                self.close_settings()
             }
             Event::WindowEvent {
                 window_id, event, ..
@@ -2589,6 +2701,7 @@ impl App {
                 }
                 UserEvent::ProcessFailed(kind) => self.on_process_failed(kind),
                 UserEvent::NavDone(ok, status) => self.on_nav_done(ok, status),
+                UserEvent::SettingsUi(body) => self.on_settings_msg(target, &body),
                 UserEvent::Page(PageMsg::State {
                     unread,
                     composing,
@@ -2760,14 +2873,8 @@ fn main() {
     win::init_identity(icon_png.as_deref());
     win::refresh_registrations(&exe);
 
-    let mut browser_args = browser_args_for(&settings, args.tray);
-    if settings.no_gpu {
-        browser_args.push_str(" --disable-gpu");
-    }
-    if !settings.extra_browser_args.trim().is_empty() {
-        browser_args.push(' ');
-        browser_args.push_str(settings.extra_browser_args.trim());
-    }
+    let browser_args = full_browser_args(&settings, args.tray);
+    let settings_snapshot = settings.clone();
 
     let mut app = App {
         web_context: WebContext::new(Some(dir.join("WebView2"))),
@@ -2829,6 +2936,9 @@ fn main() {
         background_mode: false,
         net: netrecover::NetRecovery::default(),
         env_logged: false,
+        env_opts: EnvOpts::of(&settings_snapshot),
+        started_tray: args.tray,
+        settings_win: None,
         restore_started: None,
         recreate_at: None,
         update_running: false,

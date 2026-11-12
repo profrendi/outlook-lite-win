@@ -303,4 +303,17 @@ mod tests {
         assert_eq!(serde_json::from_str::<Settings>(&j).unwrap(), s2);
         assert_eq!(Settings::default().work_hours_label(), "08:00–17:00, Sen–Jum");
     }
+
+    #[test]
+    fn isian_halaman_pengaturan_cocok_dengan_kunci() {
+        let html = include_str!("ui/settings.html");
+        let v = serde_json::to_value(Settings::default()).unwrap();
+        let mut n = 0;
+        for part in html.split("data-key=\"").skip(1) {
+            let key = &part[..part.find('"').unwrap()];
+            assert!(v.get(key).is_some(), "kunci tidak dikenal di settings.html: {key}");
+            n += 1;
+        }
+        assert!(n >= 30, "terlalu sedikit isian terbaca: {n}");
+    }
 }

@@ -66,18 +66,34 @@ Demi privasi mailbox, toast tidak berisi pengirim atau subjek. Aktifkan *Tampilk
 
 ## Menu tray
 
-Klik kiri ikon = buka jendela. Klik kanan:
+Klik kiri ikon = buka jendela Outlook. Klik kanan (menu ringkas):
 
-- **Status** (mode, jumlah belum dibaca, RAM bila diagnostik aktif)
+- **Status** (keadaan, jumlah belum dibaca, RAM & CPU bila diagnostik aktif)
 - Buka Email · Buka Kalender · Email baru · Pintasan · **Cek email sekarang**
-- **Notifikasi**: hanya jam kerja, bunyi, tampilkan pengirim & subjek, **Tes notifikasi**, mode kompatibel
-- **Jendela**: tutup otomatis saat tidak aktif, hemat RAM, tanpa GPU, tanpa service worker, zoom
-- **Pengaturan**: mulai dengan Windows, hotkey, aplikasi email default (mailto),
-  update otomatis, cek update, catat diagnostik, buat laporan diagnostik, diagnostik halaman Outlook,
-  buka folder pengaturan, buka folder aplikasi, muat ulang pengaturan, hapus instalasi
+- **Pengaturan…** → jendela pengaturan
 - Restart untuk memakai versi baru · Tutup jendela · Keluar
 
 Ikon tray: **titik merah** = ada email belum dibaca, **titik kuning** = perlu login ulang.
+
+## Jendela Pengaturan
+
+Muncul di pojok kanan bawah (dekat tray), mengikuti tema terang/gelap Windows. Semua yang
+sebelumnya hanya bisa diubah di `settings.json` kini bisa diubah di sini dan langsung disimpan:
+
+- **Aksi cepat**: Buka Email, Kalender, Email baru, Cek email sekarang, dan tombol pintasan.
+- **Notifikasi**: hanya jam kerja (jam & hari), bunyi, pengirim & subjek, mode kompatibel, tes.
+- **Jendela**: tutup otomatis (menit), ukuran tampilan, tampilan mobile di tray (eksperimen).
+- **Hemat RAM**: hemat RAM, mode efisiensi, batas rapikan & segarkan, tanpa service worker,
+  tanpa GPU, mode RAM kecil, V8 hemat memori, bersih-bersih memori saat tidak aktif.
+- **Privasi & WebView2**: blokir telemetri, tracking prevention, laporan crash lokal, WebView2
+  disiapkan sendiri, proxy lewat Windows, isolasi situs, argumen tambahan.
+- **Aplikasi**: mulai dengan Windows, hotkey (bisa diubah), mailto, update otomatis, cek update.
+- **Pintasan**: tambah/hapus/buka.
+- **Diagnostik**: catat diagnostik, laporan, diagnostik halaman, selector, folder.
+
+Pengaturan bertanda *restart* memunculkan tombol **Restart sekarang**. Jendela pengaturan memakai
+WebView2 yang sama dengan Outlook (tanpa akses internet) dan dihancurkan saat ditutup, jadi tidak
+menambah RAM saat tidak dibuka.
 
 ## Fitur lain
 
