@@ -221,6 +221,68 @@
   }
   window.__oliteUnread = () => readUnread().n;
 
+  // Eksperimen: klik lampiran Office = unduh lalu dibuka di aplikasi desktop (bukan pratinjau
+  // web yang berat). Lewat menu "Unduh" milik Outlook sendiri; bila menu tidak ditemukan,
+  // klik diteruskan seperti biasa (pratinjau).
+  if (cfg.att && Array.isArray(cfg.att.types) && cfg.att.types.length) {
+    const types = new Set(cfg.att.types.map((t) => String(t).toLowerCase()));
+    const min = +cfg.att.min || 0;
+    const nameRe = /([^\\/:*?"<>|\n,]{1,200}\.([a-z0-9]{2,5}))(?![a-z0-9])/i;
+    const sizeRe = /(\d+(?:[.,]\d+)?)\s*(KB|MB|GB|bytes?|B)\b/i;
+    const toMb = (txt) => {
+      const m = sizeRe.exec(txt || '');
+      if (!m) return null;
+      const v = parseFloat(m[1].replace(',', '.'));
+      const u = m[2].toUpperCase();
+      return u === 'GB' ? v * 1024 : u === 'MB' ? v : u === 'KB' ? v / 1024 : v / 1048576;
+    };
+    const menuBtnSel = 'button[aria-haspopup], [role="button"][aria-haspopup]';
+    const labelOf = (el) => (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '') + ' ' + (el.textContent || '').slice(0, 300);
+    // Cari kartu lampiran: leluhur terdekat (maks. 6 tingkat) yang menyebut nama file berjenis
+    // terpilih dan punya tombol menu ("Opsi lainnya").
+    const cardOf = (el) => {
+      for (let n = el, d = 0; n && n !== document.body && d < 7; n = n.parentElement, d++) {
+        const m = nameRe.exec(labelOf(n));
+        if (m && types.has(m[2].toLowerCase()) && n.querySelector(menuBtnSel)) {
+          return { card: n, name: m[1].trim(), ext: m[2].toLowerCase() };
+        }
+      }
+      return null;
+    };
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    let bypass = false;
+    window.addEventListener('click', (ev) => {
+      if (bypass || ev.button !== 0 || !ev.isTrusted) return;
+      const t = ev.target instanceof Element ? ev.target : null;
+      if (!t || t.closest(menuBtnSel) || t.closest('[role="menu"],[role="menuitem"],a[href]')) return;
+      if (t.closest('[contenteditable="true"]')) return;
+      const hit = cardOf(t);
+      if (!hit) return;
+      const mb = toMb(labelOf(hit.card));
+      if (min > 0 && (mb === null || mb < min)) return; // kecil / tak diketahui: pratinjau biasa
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      (async () => {
+        const btn = hit.card.querySelector(menuBtnSel);
+        btn.click();
+        let item = null;
+        for (let i = 0; i < 20 && !item; i++) {
+          await wait(75);
+          item = [...document.querySelectorAll('[role="menuitem"]')].find((m) =>
+            /^\s*(download|unduh)/i.test(m.textContent || m.getAttribute('aria-label') || ''));
+        }
+        if (item) {
+          post({ t: 'attach', name: hit.name, mb });
+          item.click();
+        } else {
+          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+          bypass = true;
+          try { t.click(); } finally { bypass = false; }
+        }
+      })();
+    }, true);
+  }
+
   let last = null;
   let lastSent = 0;
   let prevRaw = null;

@@ -38,10 +38,25 @@ pub fn open_url(url: &str) {
     spawn_hidden("rundll32", &["url.dll,FileProtocolHandler", url]);
 }
 
+/// Buka file dengan aplikasi default Windows (mis. .xlsx → Excel).
+pub fn open_file(path: &Path) {
+    let _ = std::process::Command::new(if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    })
+    .arg(path)
+    .spawn();
+}
+
 pub fn open_folder(path: &Path) {
-    let _ = std::process::Command::new(if cfg!(windows) { "explorer" } else { "xdg-open" })
-        .arg(path)
-        .spawn();
+    let _ = std::process::Command::new(if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    })
+    .arg(path)
+    .spawn();
 }
 
 /// Buka Explorer dengan file ini terpilih.
@@ -84,7 +99,9 @@ pub fn open_in_notepad(path: &Path) {
 /// Halaman "Aplikasi default" Windows, langsung ke entri Outlook Lite bila didukung.
 pub fn open_default_apps_settings() {
     let _ = std::process::Command::new("explorer")
-        .arg(format!("ms-settings:defaultapps?registeredAppUser={APP_REG_NAME}"))
+        .arg(format!(
+            "ms-settings:defaultapps?registeredAppUser={APP_REG_NAME}"
+        ))
         .spawn();
 }
 
@@ -104,7 +121,10 @@ mod imp {
     use super::*;
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
-    fn message_box(text: &str, flags: windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE) -> i32 {
+    fn message_box(
+        text: &str,
+        flags: windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE,
+    ) -> i32 {
         use windows::core::HSTRING;
         use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_SETFOREGROUND, MB_TOPMOST};
         unsafe {
@@ -115,6 +135,55 @@ mod imp {
                 flags | MB_TOPMOST | MB_SETFOREGROUND,
             )
             .0
+        }
+    }
+
+    /// Salin teks (Unicode) ke clipboard Windows.
+    pub fn set_clipboard_text(text: &str) -> bool {
+        use windows::Win32::Foundation::GlobalFree;
+        use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+        use windows::Win32::System::DataExchange::{
+            CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+        };
+        use windows::Win32::System::Memory::{
+            GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+        };
+        use windows::Win32::System::Ole::CF_UNICODETEXT;
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            // Clipboard bisa sedang dipegang aplikasi lain: coba beberapa kali.
+            let mut opened = false;
+            for _ in 0..10 {
+                if OpenClipboard(None).is_ok() {
+                    opened = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            if !opened {
+                return false;
+            }
+            let ok = (|| -> Option<()> {
+                EmptyClipboard().ok()?;
+                let bytes = wide.len() * 2;
+                let h: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE, bytes).ok()?;
+                let p = GlobalLock(h) as *mut u16;
+                if p.is_null() {
+                    let _ = GlobalFree(Some(h));
+                    return None;
+                }
+                std::ptr::copy_nonoverlapping(wide.as_ptr(), p, wide.len());
+                let _ = GlobalUnlock(h);
+                if SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(h.0))).is_err() {
+                    // Gagal: memori masih milik kita.
+                    let _ = GlobalFree(Some(h));
+                    return None;
+                }
+                Some(())
+            })()
+            .is_some();
+            let _ = CloseClipboard();
+            ok
         }
     }
 
@@ -137,7 +206,9 @@ mod imp {
     pub fn init_identity(icon_png: Option<&Path>) {
         use windows::core::HSTRING;
         use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
-        if let Ok((k, _)) = hkcu().create_subkey(format!(r"Software\Classes\AppUserModelId\{AUMID}")) {
+        if let Ok((k, _)) =
+            hkcu().create_subkey(format!(r"Software\Classes\AppUserModelId\{AUMID}"))
+        {
             let _ = k.set_value("DisplayName", &"Outlook Lite".to_string());
             if let Some(p) = icon_png {
                 let _ = k.set_value("IconUri", &p.display().to_string());
@@ -188,7 +259,11 @@ mod imp {
     }
 
     pub fn autostart_value() -> Option<String> {
-        hkcu().open_subkey(RUN_KEY).ok()?.get_value(APP_REG_NAME).ok()
+        hkcu()
+            .open_subkey(RUN_KEY)
+            .ok()?
+            .get_value(APP_REG_NAME)
+            .ok()
     }
 
     // ---------- mailto ----------
@@ -214,7 +289,10 @@ mod imp {
         urls.set_value("mailto", &"OutlookLite.mailto".to_string())?;
 
         let (reg, _) = h.create_subkey(r"Software\RegisteredApplications")?;
-        reg.set_value(APP_REG_NAME, &r"Software\OutlookLite\Capabilities".to_string())
+        reg.set_value(
+            APP_REG_NAME,
+            &r"Software\OutlookLite\Capabilities".to_string(),
+        )
     }
 
     pub fn unregister_mailto() {
@@ -272,7 +350,11 @@ mod imp {
             };
             if Process32FirstW(snap, &mut e).is_ok() {
                 loop {
-                    let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+                    let len = e
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(e.szExeFile.len());
                     let name = String::from_utf16_lossy(&e.szExeFile[..len]);
                     if name.eq_ignore_ascii_case("msedgewebview2.exe") {
                         pairs.push((e.th32ProcessID, e.th32ParentProcessID));
@@ -432,13 +514,29 @@ mod imp {
         let throttle = PROCESS_POWER_THROTTLING_STATE {
             Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
             // Saat normal: ControlMask 0 = serahkan ke Windows (bawaan).
-            ControlMask: if background { PROCESS_POWER_THROTTLING_EXECUTION_SPEED } else { 0 },
-            StateMask: if background { PROCESS_POWER_THROTTLING_EXECUTION_SPEED } else { 0 },
+            ControlMask: if background {
+                PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            } else {
+                0
+            },
+            StateMask: if background {
+                PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            } else {
+                0
+            },
         };
         let mem = MEMORY_PRIORITY_INFORMATION {
-            MemoryPriority: if background { MEMORY_PRIORITY_LOW } else { MEMORY_PRIORITY_NORMAL },
+            MemoryPriority: if background {
+                MEMORY_PRIORITY_LOW
+            } else {
+                MEMORY_PRIORITY_NORMAL
+            },
         };
-        let class = if background { BELOW_NORMAL_PRIORITY_CLASS } else { NORMAL_PRIORITY_CLASS };
+        let class = if background {
+            BELOW_NORMAL_PRIORITY_CLASS
+        } else {
+            NORMAL_PRIORITY_CLASS
+        };
         let mut n = 0;
         for pid in tree_pids() {
             unsafe {
@@ -476,7 +574,8 @@ mod imp {
         browser_args: &str,
         tracking_prevention: bool,
         local_crash_reports: bool,
-    ) -> Result<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment, String> {
+    ) -> Result<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Environment, String>
+    {
         use webview2_com::{
             CoreWebView2EnvironmentOptions, CreateCoreWebView2EnvironmentCompletedHandler,
             Microsoft::Web::WebView2::Win32::{
@@ -499,7 +598,9 @@ mod imp {
                 &CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
                     move |error_code, environment| {
                         let r = error_code.and_then(|_| {
-                            environment.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_POINTER))
+                            environment.ok_or_else(|| {
+                                windows::core::Error::from(windows::Win32::Foundation::E_POINTER)
+                            })
                         });
                         let _ = tx.send(r);
                         Ok(())
@@ -536,12 +637,18 @@ mod imp {
         use wry::WebViewExtWindows;
         let wv = webview.webview();
         unsafe {
-            if let Ok(st) = wv.Settings().and_then(|s| s.cast::<ICoreWebView2Settings4>()) {
+            if let Ok(st) = wv
+                .Settings()
+                .and_then(|s| s.cast::<ICoreWebView2Settings4>())
+            {
                 let _ = st.SetIsGeneralAutofillEnabled(false);
                 let _ = st.SetIsPasswordAutosaveEnabled(false);
             }
             // SmartScreen (cek reputasi alamat ke Microsoft) dimatikan lewat API resmi.
-            if let Ok(st) = wv.Settings().and_then(|s| s.cast::<ICoreWebView2Settings8>()) {
+            if let Ok(st) = wv
+                .Settings()
+                .and_then(|s| s.cast::<ICoreWebView2Settings8>())
+            {
                 let _ = st.SetIsReputationCheckingRequired(false);
             }
             // Izin yang tidak dipakai Outlook ditolak tanpa bertanya. Notifikasi, clipboard,
@@ -569,19 +676,23 @@ mod imp {
 
             // Catat domain yang dihubungi (untuk laporan diagnostik; tanpa alamat lengkap).
             if let Ok(wv2) = wv.cast::<ICoreWebView2_2>() {
-                let rec = WebResourceResponseReceivedEventHandler::create(Box::new(|_wv, args| {
-                    if !crate::diag::domains_enabled() {
-                        return Ok(());
-                    }
-                    let Some(a) = args else { return Ok(()) };
-                    let mut uri = PWSTR::null();
-                    a.Request()?.Uri(&mut uri)?;
-                    let uri = take_pwstr(uri);
-                    if let Some(h) = crate::urlutil::host_of(&uri) {
-                        crate::diag::record_domain(&h, false);
-                    }
-                    Ok(())
-                }));
+                let rec =
+                    WebResourceResponseReceivedEventHandler::create(Box::new(move |_wv, args| {
+                        if !crate::diag::domains_enabled() {
+                            return Ok(());
+                        }
+                        let Some(a) = args else { return Ok(()) };
+                        let mut uri = PWSTR::null();
+                        a.Request()?.Uri(&mut uri)?;
+                        let uri = take_pwstr(uri);
+                        if let Some(h) = crate::urlutil::host_of(&uri) {
+                            // Respons 204 buatan kita untuk host yang diblokir tidak dihitung "dimuat".
+                            if !crate::urlutil::host_matches_pattern(&h, blocked_hosts) {
+                                crate::diag::record_domain(&h, false);
+                            }
+                        }
+                        Ok(())
+                    }));
                 let mut rtoken = 0i64;
                 let _ = wv2.add_WebResourceResponseReceived(&rec, &mut rtoken);
             }
@@ -590,32 +701,34 @@ mod imp {
             }
             for host in blocked_hosts {
                 let filter = HSTRING::from(format!("https://{host}/*"));
-                let _ = wv.AddWebResourceRequestedFilter(&filter, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+                let _ = wv
+                    .AddWebResourceRequestedFilter(&filter, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
             }
-            let handler = WebResourceRequestedEventHandler::create(Box::new(move |sender, args| {
-                let (Some(sender), Some(args)) = (sender, args) else {
-                    return Ok(());
-                };
-                let mut uri = PWSTR::null();
-                args.Request()?.Uri(&mut uri)?;
-                let uri = take_pwstr(uri);
-                let host = crate::urlutil::host_of(&uri).unwrap_or_default();
-                if !crate::urlutil::host_matches_pattern(&host, blocked_hosts) {
-                    return Ok(());
-                }
-                if crate::diag::domains_enabled() {
-                    crate::diag::record_domain(&host, true);
-                }
-                let env = sender.cast::<ICoreWebView2_2>()?.Environment()?;
-                let resp = env.CreateWebResourceResponse(
-                    None::<&windows::Win32::System::Com::IStream>,
-                    204,
-                    w!("No Content"),
-                    w!(""),
-                )?;
-                args.SetResponse(&resp)?;
-                Ok(())
-            }));
+            let handler =
+                WebResourceRequestedEventHandler::create(Box::new(move |sender, args| {
+                    let (Some(sender), Some(args)) = (sender, args) else {
+                        return Ok(());
+                    };
+                    let mut uri = PWSTR::null();
+                    args.Request()?.Uri(&mut uri)?;
+                    let uri = take_pwstr(uri);
+                    let host = crate::urlutil::host_of(&uri).unwrap_or_default();
+                    if !crate::urlutil::host_matches_pattern(&host, blocked_hosts) {
+                        return Ok(());
+                    }
+                    if crate::diag::domains_enabled() {
+                        crate::diag::record_domain(&host, true);
+                    }
+                    let env = sender.cast::<ICoreWebView2_2>()?.Environment()?;
+                    let resp = env.CreateWebResourceResponse(
+                        None::<&windows::Win32::System::Com::IStream>,
+                        204,
+                        w!("No Content"),
+                        w!(""),
+                    )?;
+                    args.SetResponse(&resp)?;
+                    Ok(())
+                }));
             let mut token = 0i64;
             let _ = wv.add_WebResourceRequested(&handler, &mut token);
         }
@@ -642,13 +755,17 @@ mod imp {
         }));
         let mut token = 0i64;
         unsafe {
-            let _ = webview.webview().add_NavigationCompleted(&handler, &mut token);
+            let _ = webview
+                .webview()
+                .add_NavigationCompleted(&handler, &mut token);
         }
     }
 
     /// Apakah Windows melaporkan ada koneksi internet. Bila tidak bisa ditanyakan, dianggap ada.
     pub fn is_online() -> bool {
-        use windows::Win32::Networking::NetworkListManager::{INetworkListManager, NetworkListManager};
+        use windows::Win32::Networking::NetworkListManager::{
+            INetworkListManager, NetworkListManager,
+        };
         use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
         unsafe {
             CoCreateInstance::<_, INetworkListManager>(&NetworkListManager, None, CLSCTX_ALL)
@@ -660,20 +777,54 @@ mod imp {
 
     /// Panggil `cb` dengan jenis kegagalan bila proses WebView2 mati/macet
     /// (0 = browser, 1 = renderer halaman keluar, 2 = renderer tidak merespons, 6 = GPU, ...).
-    pub fn on_process_failed(webview: &wry::WebView, cb: impl Fn(i32) + 'static) {
+    /// Proses WebView2 gagal: `cb(jenis, alasan, detail)`. Alasan (Reason) & detail (kode keluar,
+    /// nama proses, modul penyebab) dibaca bila runtime mendukung (ProcessFailedEventArgs2/3).
+    pub fn on_process_failed(webview: &wry::WebView, cb: impl Fn(i32, i32, String) + 'static) {
         use webview2_com::{
-            Microsoft::Web::WebView2::Win32::COREWEBVIEW2_PROCESS_FAILED_KIND,
+            Microsoft::Web::WebView2::Win32::{
+                ICoreWebView2ProcessFailedEventArgs2, ICoreWebView2ProcessFailedEventArgs3,
+                COREWEBVIEW2_PROCESS_FAILED_KIND, COREWEBVIEW2_PROCESS_FAILED_REASON,
+            },
             ProcessFailedEventHandler,
         };
+        use windows::core::Interface;
         use wry::WebViewExtWindows;
         let handler = ProcessFailedEventHandler::create(Box::new(move |_wv, args| {
             let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND(-1);
+            let mut reason = -1i32;
+            let mut detail = String::new();
             if let Some(a) = args {
                 unsafe {
                     let _ = a.ProcessFailedKind(&mut kind);
+                    if let Ok(a2) = a.cast::<ICoreWebView2ProcessFailedEventArgs2>() {
+                        let mut r = COREWEBVIEW2_PROCESS_FAILED_REASON::default();
+                        if a2.Reason(&mut r).is_ok() {
+                            reason = r.0;
+                        }
+                        let mut code = 0i32;
+                        if a2.ExitCode(&mut code).is_ok() && code != 0 {
+                            detail.push_str(&format!(" kode=0x{:08X}", code as u32));
+                        }
+                        let mut p = windows::core::PWSTR::null();
+                        if a2.ProcessDescription(&mut p).is_ok() {
+                            let d = webview2_com::take_pwstr(p);
+                            if !d.is_empty() {
+                                detail.push_str(&format!(" proses=\"{d}\""));
+                            }
+                        }
+                    }
+                    if let Ok(a3) = a.cast::<ICoreWebView2ProcessFailedEventArgs3>() {
+                        let mut p = windows::core::PWSTR::null();
+                        if a3.FailureSourceModulePath(&mut p).is_ok() {
+                            let m = webview2_com::take_pwstr(p);
+                            if !m.is_empty() {
+                                detail.push_str(&format!(" modul={m}"));
+                            }
+                        }
+                    }
                 }
             }
-            cb(kind.0);
+            cb(kind.0, reason, detail.trim().to_string());
             Ok(())
         }));
         let mut token = 0i64;
@@ -726,9 +877,11 @@ mod imp {
         let mut n = 0;
         for pid in tree_pids() {
             unsafe {
-                let Ok(h) =
-                    OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA, false, pid)
-                else {
+                let Ok(h) = OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA,
+                    false,
+                    pid,
+                ) else {
                     continue;
                 };
                 if EmptyWorkingSet(h).is_ok() {
@@ -744,7 +897,9 @@ mod imp {
 
     /// Minta WebView2 menangguhkan halaman (hanya berhasil bila webview tidak terlihat).
     pub fn try_suspend(webview: &wry::WebView) {
-        use webview2_com::{Microsoft::Web::WebView2::Win32::ICoreWebView2_3, TrySuspendCompletedHandler};
+        use webview2_com::{
+            Microsoft::Web::WebView2::Win32::ICoreWebView2_3, TrySuspendCompletedHandler,
+        };
         use windows::core::Interface;
         use wry::WebViewExtWindows;
         if let Ok(wv3) = webview.webview().cast::<ICoreWebView2_3>() {
@@ -757,8 +912,8 @@ mod imp {
 
     pub fn download(url: &str, dest: &Path) -> Result<(), String> {
         use windows::core::HSTRING;
-        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
         use windows::Win32::System::Com::Urlmon::URLDownloadToFileW;
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             URLDownloadToFileW(
@@ -776,6 +931,9 @@ mod imp {
 #[cfg(not(windows))]
 mod imp {
     use super::*;
+    pub fn set_clipboard_text(_text: &str) -> bool {
+        false
+    }
     pub fn confirm(text: &str) -> bool {
         eprintln!("[konfirmasi] {text}");
         false
@@ -817,7 +975,7 @@ mod imp {
     pub fn system_info() -> String {
         String::new()
     }
-    pub fn on_process_failed(_webview: &wry::WebView, _cb: impl Fn(i32) + 'static) {}
+    pub fn on_process_failed(_webview: &wry::WebView, _cb: impl Fn(i32, i32, String) + 'static) {}
     pub fn on_navigation_completed(_webview: &wry::WebView, _cb: impl Fn(bool, i32) + 'static) {}
     pub fn is_online() -> bool {
         true

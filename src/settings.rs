@@ -93,8 +93,36 @@ pub struct Settings {
     pub hotkey_warned: String,
     pub auto_update: bool,
     pub diagnostics: bool,
-    /// Matikan akselerasi GPU (berlaku setelah restart). Hemat ~50-80 MB.
+    /// Versi lama (sampai v0.1.15): GPU mati. Hanya dibaca untuk migrasi ke `gpu_mode`.
+    #[serde(default, skip_serializing)]
     pub no_gpu: bool,
+    /// GPU WebView2: "full" (penuh), "lite" (komposisi GPU, gambar halaman oleh CPU), "off".
+    /// Berlaku setelah restart.
+    pub gpu_mode: String,
+    /// Pratinjau Excel/Word/PowerPoint Online berjalan di proses sendiri (berlaku setelah restart).
+    pub isolate_office: bool,
+    /// Blokir iklan/konten MSN dan telemetri Excel/Azure (arc.msn.com dll.).
+    pub block_extra: bool,
+    /// Matikan eksperimen jarak jauh Microsoft (field trial) dan API iklan Chromium (restart).
+    pub disable_field_trials: bool,
+    /// Uji coba: Outlook selalu dimuat dari outlook.cloud.microsoft (satu alamat, satu cache).
+    pub unify_domain: bool,
+    /// Peringatan bila RAM Outlook Lite melewati ini (MB) saat jendela dipakai. 0 = mati.
+    pub memory_warn_mb: u32,
+    // --- lampiran ---
+    /// Lampiran Office yang diunduh langsung dibuka di aplikasi desktop (Excel/Word).
+    pub attach_desktop: bool,
+    /// Hanya file berukuran minimal ini (MB). 0 = semua ukuran.
+    pub attach_min_mb: f64,
+    pub attach_excel: bool,
+    pub attach_word: bool,
+    pub attach_ppt: bool,
+    pub attach_pdf: bool,
+    /// Eksperimen: klik lampiran Office = unduh lalu buka di aplikasi desktop (bukan pratinjau web).
+    pub attach_intercept_preview: bool,
+    /// Versi format pengaturan (untuk migrasi otomatis). File lama tanpa kunci ini = 0.
+    #[serde(default)]
+    pub settings_version: u32,
     /// Matikan service worker Outlook (proses renderer tambahan ~30-45 MB).
     pub block_service_worker: bool,
     /// V8 mengutamakan ukuran memori (berlaku setelah restart).
@@ -124,7 +152,7 @@ impl Default for Settings {
             trim_ws_mb: 40,
             efficiency_mode: true,
             block_telemetry: true,
-            low_end_mode: true,
+            low_end_mode: false,
             theme: "system".into(),
             custom_environment: true,
             tracking_prevention: false,
@@ -152,7 +180,21 @@ impl Default for Settings {
             hotkey_warned: String::new(),
             auto_update: true,
             diagnostics: false,
-            no_gpu: true,
+            no_gpu: false,
+            gpu_mode: "lite".into(),
+            isolate_office: true,
+            block_extra: true,
+            disable_field_trials: true,
+            unify_domain: false,
+            memory_warn_mb: 1000,
+            attach_desktop: true,
+            attach_min_mb: 0.0,
+            attach_excel: true,
+            attach_word: true,
+            attach_ppt: false,
+            attach_pdf: false,
+            attach_intercept_preview: false,
+            settings_version: SETTINGS_VERSION,
             block_service_worker: true,
             v8_optimize_for_size: true,
             site_isolation: false,
@@ -160,6 +202,9 @@ impl Default for Settings {
         }
     }
 }
+
+/// Versi format pengaturan saat ini. Naikkan bila perlu migrasi baru (lihat `migrate`).
+pub const SETTINGS_VERSION: u32 = 16;
 
 fn parse_hm(s: &str) -> Option<u32> {
     let (h, m) = s.trim().split_once(':')?;
@@ -178,6 +223,11 @@ impl Settings {
         match std::fs::read_to_string(&p) {
             Ok(s) => match serde_json::from_str::<Settings>(&s) {
                 Ok(mut st) => {
+                    if st.migrate() {
+                        let _ = std::fs::copy(&p, dir.join("settings.sebelum-migrasi.json"));
+                        st.sanitize();
+                        let _ = st.save(dir);
+                    }
                     st.sanitize();
                     st
                 }
@@ -197,7 +247,34 @@ impl Settings {
         std::fs::rename(tmp, Self::path(dir))
     }
 
+    /// Perbarui pengaturan dari versi lama. Mengembalikan true bila ada yang diubah.
+    pub fn migrate(&mut self) -> bool {
+        if self.settings_version >= SETTINGS_VERSION {
+            return false;
+        }
+        if self.settings_version < 16 {
+            // v0.1.16: Mode RAM kecil Chromium membuat Outlook kehabisan memori saat membuka
+            // lampiran besar (Chromium mengira PC hanya ber-RAM ~512 MB) → dimatikan.
+            self.low_end_mode = false;
+            // "Tanpa GPU" diganti pilihan GPU; GPU mati menjadi "Ringan" (gulir lebih halus).
+            self.gpu_mode = "lite".into();
+            self.no_gpu = false;
+        }
+        self.settings_version = SETTINGS_VERSION;
+        true
+    }
+
     pub fn sanitize(&mut self) {
+        if !matches!(self.gpu_mode.as_str(), "full" | "lite" | "off") {
+            self.gpu_mode = "lite".into();
+        }
+        if self.memory_warn_mb != 0 {
+            self.memory_warn_mb = self.memory_warn_mb.clamp(300, 16000);
+        }
+        if !self.attach_min_mb.is_finite() || self.attach_min_mb < 0.0 {
+            self.attach_min_mb = 0.0;
+        }
+        self.attach_min_mb = self.attach_min_mb.min(2000.0);
         if self.refresh_mb != 0 {
             self.refresh_mb = self.refresh_mb.clamp(300, 8000);
         }
@@ -249,7 +326,6 @@ impl Settings {
             Mode::Jeda
         }
     }
-
 }
 
 #[cfg(test)]
@@ -299,9 +375,43 @@ mod tests {
         let mut n = 0;
         for part in html.split("data-key=\"").skip(1) {
             let key = &part[..part.find('"').unwrap()];
-            assert!(v.get(key).is_some(), "kunci tidak dikenal di settings.html: {key}");
+            assert!(
+                v.get(key).is_some(),
+                "kunci tidak dikenal di settings.html: {key}"
+            );
             n += 1;
         }
         assert!(n >= 30, "terlalu sedikit isian terbaca: {n}");
+    }
+
+    #[test]
+    fn migrasi_dari_v0_1_15() {
+        let lama = r#"{"low_end_mode":true,"no_gpu":true,"zoom":1.0,"sound":false}"#;
+        let mut s: Settings = serde_json::from_str(lama).unwrap();
+        assert_eq!(s.settings_version, 0);
+        assert!(s.migrate());
+        assert!(!s.low_end_mode);
+        assert_eq!(s.gpu_mode, "lite");
+        assert!(!s.sound, "pengaturan lain tetap");
+        assert_eq!(s.settings_version, SETTINGS_VERSION);
+        assert!(!s.migrate(), "migrasi hanya sekali");
+        // Setelah disimpan, no_gpu tidak ditulis lagi dan migrasi tidak berulang.
+        let baru = serde_json::to_string(&s).unwrap();
+        assert!(!baru.contains("no_gpu"));
+        let mut s2: Settings = serde_json::from_str(&baru).unwrap();
+        assert!(!s2.migrate());
+        // Pengguna lalu menyalakan mode RAM kecil lagi: tidak dimatikan ulang.
+        s2.low_end_mode = true;
+        let mut s3: Settings = serde_json::from_str(&serde_json::to_string(&s2).unwrap()).unwrap();
+        assert!(!s3.migrate());
+        assert!(s3.low_end_mode);
+    }
+
+    #[test]
+    fn instal_baru_tidak_perlu_migrasi() {
+        let mut s = Settings::default();
+        assert!(!s.migrate());
+        assert_eq!(s.gpu_mode, "lite");
+        assert!(!s.low_end_mode);
     }
 }

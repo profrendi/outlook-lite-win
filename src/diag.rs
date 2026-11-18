@@ -117,6 +117,11 @@ impl Sampler {
         }
     }
 
+    /// Belum pernah mengambil sampel (CPU sampel berikutnya belum bermakna).
+    pub fn is_fresh(&self) -> bool {
+        self.prev_at.is_none()
+    }
+
     /// Ubah satu snapshot proses menjadi baris CSV. CPU% = persen dari seluruh CPU
     /// (sama seperti Task Manager); sampel pertama CPU-nya 0.
     pub fn row(
@@ -293,7 +298,11 @@ impl Row {
             unread: f[19].trim().parse().ok(),
             // Format lama (v0.1.6-v0.1.10) tanpa kolom page fault: 21 kolom.
             pf_per_min: if f.len() >= 22 { n(20) } else { 0.0 },
-            note: if f.len() >= 22 { f[21..].join(",") } else { f[20..].join(",") },
+            note: if f.len() >= 22 {
+                f[21..].join(",")
+            } else {
+                f[20..].join(",")
+            },
         })
     }
 }
@@ -390,11 +399,18 @@ const CSV_MAX: u64 = 2 * 1024 * 1024;
 
 pub fn append_row(dir: &Path, row: &Row) {
     let p = csv_path(dir);
-    if std::fs::metadata(&p).map(|m| m.len() > CSV_MAX).unwrap_or(false) {
+    if std::fs::metadata(&p)
+        .map(|m| m.len() > CSV_MAX)
+        .unwrap_or(false)
+    {
         let _ = std::fs::rename(&p, dir.join("diagnostik.old.csv"));
     }
     let new = !p.exists();
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&p)
+    {
         if new {
             let _ = writeln!(f, "{CSV_HEADER}");
         }
@@ -446,14 +462,26 @@ pub fn summarize(rows: &[Row]) -> String {
     const ORDER: [&str; 5] = ["dipakai", "tak-fokus", "minimize", "tray", "jeda"];
     let mut groups: BTreeMap<usize, Vec<&Row>> = BTreeMap::new();
     for r in rows {
-        let i = ORDER.iter().position(|s| *s == r.state).unwrap_or(ORDER.len());
+        let i = ORDER
+            .iter()
+            .position(|s| *s == r.state)
+            .unwrap_or(ORDER.len());
         groups.entry(i).or_default().push(r);
     }
     let mut out = String::new();
     let _ = writeln!(
         out,
         "{:<10} {:>6} | {:>17} | {:>8} | {:>8} | {:>17} | {:>8} | {:>6} | {:>8} | {:>9}",
-        "keadaan", "sampel", "RAM MB rata (min-maks)", "commit", "CPU % rt", "renderer utama", "rend.lain", "GPU", "CPU% maks", "PF/mnt rt"
+        "keadaan",
+        "sampel",
+        "RAM MB rata (min-maks)",
+        "commit",
+        "CPU % rt",
+        "renderer utama",
+        "rend.lain",
+        "GPU",
+        "CPU% maks",
+        "PF/mnt rt"
     );
     for (i, rs) in groups {
         let name = ORDER.get(i).copied().unwrap_or("lain");
@@ -504,12 +532,54 @@ mod tests {
 
     fn procs(cpu: u64) -> Vec<Proc> {
         vec![
-            Proc { pid: 1, kind: Some(Kind::Aplikasi), working: 5 << 20, commit: 6 << 20, cpu_time: cpu, page_faults: 0 },
-            Proc { pid: 2, kind: Some(Kind::Browser), working: 40 << 20, commit: 50 << 20, cpu_time: 0, page_faults: 0 },
-            Proc { pid: 3, kind: Some(Kind::Renderer), working: 300 << 20, commit: 400 << 20, cpu_time: cpu * 2, page_faults: 0 },
-            Proc { pid: 4, kind: Some(Kind::Renderer), working: 30 << 20, commit: 35 << 20, cpu_time: 0, page_faults: 0 },
-            Proc { pid: 5, kind: Some(Kind::Gpu), working: 13 << 20, commit: 20 << 20, cpu_time: 0, page_faults: 0 },
-            Proc { pid: 6, kind: None, working: 2 << 20, commit: 2 << 20, cpu_time: 0, page_faults: 0 },
+            Proc {
+                pid: 1,
+                kind: Some(Kind::Aplikasi),
+                working: 5 << 20,
+                commit: 6 << 20,
+                cpu_time: cpu,
+                page_faults: 0,
+            },
+            Proc {
+                pid: 2,
+                kind: Some(Kind::Browser),
+                working: 40 << 20,
+                commit: 50 << 20,
+                cpu_time: 0,
+                page_faults: 0,
+            },
+            Proc {
+                pid: 3,
+                kind: Some(Kind::Renderer),
+                working: 300 << 20,
+                commit: 400 << 20,
+                cpu_time: cpu * 2,
+                page_faults: 0,
+            },
+            Proc {
+                pid: 4,
+                kind: Some(Kind::Renderer),
+                working: 30 << 20,
+                commit: 35 << 20,
+                cpu_time: 0,
+                page_faults: 0,
+            },
+            Proc {
+                pid: 5,
+                kind: Some(Kind::Gpu),
+                working: 13 << 20,
+                commit: 20 << 20,
+                cpu_time: 0,
+                page_faults: 0,
+            },
+            Proc {
+                pid: 6,
+                kind: None,
+                working: 2 << 20,
+                commit: 2 << 20,
+                cpu_time: 0,
+                page_faults: 0,
+            },
         ]
     }
 
@@ -549,7 +619,14 @@ mod tests {
         for x in &mut p {
             x.page_faults += 100; // 6 proses x 100 = 600 dalam 30 detik = 1200/menit
         }
-        let r = s.row(t + Duration::from_secs(30), "b".into(), State::Tray, &p, Some(4), "x");
+        let r = s.row(
+            t + Duration::from_secs(30),
+            "b".into(),
+            State::Tray,
+            &p,
+            Some(4),
+            "x",
+        );
         assert_eq!(r.pf_per_min, 1200.0);
         assert_eq!(Row::from_csv(&r.to_csv()).unwrap(), r);
         // Baris versi lama (21 kolom) tetap terbaca.
@@ -574,7 +651,11 @@ mod tests {
         assert_eq!(m["outlook.cloud.microsoft"], (3, 0));
         assert_eq!(m["browser.events.data.microsoft.com"], (0, 1));
         let rep = domains_report(&dir);
-        assert!(rep.lines().nth(1).unwrap().starts_with("outlook.cloud.microsoft"));
+        assert!(rep
+            .lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("outlook.cloud.microsoft"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -585,7 +666,14 @@ mod tests {
         let rows: Vec<Row> = (0..4)
             .map(|i| {
                 let st = if i < 2 { State::Dipakai } else { State::Tray };
-                s.row(t + Duration::from_secs(i), format!("t{i}"), st, &procs(i * 100), None, "")
+                s.row(
+                    t + Duration::from_secs(i),
+                    format!("t{i}"),
+                    st,
+                    &procs(i * 100),
+                    None,
+                    "",
+                )
             })
             .collect();
         let sum = summarize(&rows);

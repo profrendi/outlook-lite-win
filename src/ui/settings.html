@@ -163,14 +163,19 @@
     <div class="row"><div class="label">Segarkan paling lambat tiap (jam)</div><input type="number" min="0" max="72" data-key="refresh_hours"></div>
     <div class="row"><div class="label">Tanpa service worker Outlook<span class="hint">Satu proses lebih sedikit (~30–45 MB).</span></div>
       <label class="switch"><input type="checkbox" data-key="block_service_worker" data-menu="no_sw"><span></span></label></div>
-    <div class="row"><div class="label">Tanpa GPU<span class="tag">restart</span><span class="hint">Hemat 50–80 MB; gulir sedikit kurang halus.</span></div>
-      <label class="switch"><input type="checkbox" data-key="no_gpu"><span></span></label></div>
-    <div class="row"><div class="label">Mode RAM kecil Chromium<span class="tag">restart</span></div>
+    <div class="row"><div class="label">GPU<span class="tag">restart</span><span class="hint">Ringan = gulir halus, hemat RAM. Mati = paling hemat, gulir tabel besar berat.</span></div>
+      <div class="seg" role="radiogroup" aria-label="GPU">
+        <label><input type="radio" name="gpu_mode" value="full" data-key="gpu_mode"><span>Penuh</span></label>
+        <label><input type="radio" name="gpu_mode" value="lite" data-key="gpu_mode"><span>Ringan</span></label>
+        <label><input type="radio" name="gpu_mode" value="off" data-key="gpu_mode"><span>Mati</span></label>
+      </div></div>
+    <div class="row"><div class="label">Mode RAM kecil Chromium<span class="tag">restart</span><span class="hint">Tidak disarankan: lampiran besar bisa membuat Outlook kehabisan memori.</span></div>
       <label class="switch"><input type="checkbox" data-key="low_end_mode"><span></span></label></div>
     <div class="row"><div class="label">JavaScript hemat memori (V8)<span class="tag">restart</span></div>
       <label class="switch"><input type="checkbox" data-key="v8_optimize_for_size"><span></span></label></div>
     <div class="row"><div class="label">Bersih-bersih memori saat tidak aktif<span class="tag">restart</span><span class="hint">Fitur WebView2 sendiri.</span></div>
       <label class="switch"><input type="checkbox" data-key="simulate_memory_pressure"><span></span></label></div>
+    <div class="row"><div class="label">Peringatan bila RAM lebih dari (MB)<span class="hint">Saat jendela dipakai. 0 = mati.</span></div><input type="number" min="0" max="16000" data-key="memory_warn_mb"></div>
   </div>
 </details>
 
@@ -179,6 +184,10 @@
   <div class="rows">
     <div class="row"><div class="label">Blokir telemetri Outlook/Office</div>
       <label class="switch"><input type="checkbox" data-key="block_telemetry"><span></span></label></div>
+    <div class="row"><div class="label">Blokir iklan MSN &amp; telemetri Excel/Azure<span class="hint">arc.msn.com, excel-telemetry, js.monitor.azure.com.</span></div>
+      <label class="switch"><input type="checkbox" data-key="block_extra"><span></span></label></div>
+    <div class="row"><div class="label">Tanpa eksperimen jarak jauh &amp; API iklan<span class="tag">restart</span><span class="hint">Field trial Microsoft, Topics, FLEDGE, Attribution Reporting.</span></div>
+      <label class="switch"><input type="checkbox" data-key="disable_field_trials"><span></span></label></div>
     <div class="row"><div class="label">Tracking prevention<span class="tag">restart</span><span class="hint">Mati = lebih ringan; aman karena hanya memuat Outlook.</span></div>
       <label class="switch"><input type="checkbox" data-key="tracking_prevention"><span></span></label></div>
     <div class="row"><div class="label">Laporan crash disimpan lokal<span class="tag">restart</span><span class="hint">Tidak dikirim ke Microsoft.</span></div>
@@ -187,10 +196,32 @@
       <label class="switch"><input type="checkbox" data-key="custom_environment"><span></span></label></div>
     <div class="row"><div class="label">Proxy lewat Windows<span class="tag">restart</span><span class="hint">Membantu jaringan kantor saat PC baru menyala.</span></div>
       <label class="switch"><input type="checkbox" data-key="system_proxy_resolver"><span></span></label></div>
-    <div class="row"><div class="label">Isolasi situs<span class="tag">restart</span><span class="hint">Nyala = lebih banyak proses &amp; RAM.</span></div>
+    <div class="row"><div class="label">Pisahkan pratinjau Excel/Word/PowerPoint<span class="tag">restart</span><span class="hint">Pratinjau lampiran di proses sendiri: bila kehabisan memori, Outlook tidak ikut tertutup.</span></div>
+      <label class="switch"><input type="checkbox" data-key="isolate_office"><span></span></label></div>
+    <div class="row"><div class="label">Isolasi situs penuh<span class="tag">restart</span><span class="hint">Nyala = lebih banyak proses &amp; RAM.</span></div>
       <label class="switch"><input type="checkbox" data-key="site_isolation"><span></span></label></div>
+    <div class="row"><div class="label">Satu alamat Outlook<span class="tag">eksperimen</span><span class="hint">Selalu outlook.cloud.microsoft (satu cache). Matikan bila ada masalah login.</span></div>
+      <label class="switch"><input type="checkbox" data-key="unify_domain"><span></span></label></div>
     <div class="row" style="display:block"><div class="label">Argumen WebView2 tambahan<span class="tag">restart</span></div>
       <input type="text" data-key="extra_browser_args" placeholder="kosong" spellcheck="false"></div>
+  </div>
+</details>
+
+<details>
+  <summary>Lampiran</summary>
+  <div class="rows">
+    <div class="row"><div class="label">Buka lampiran Office di aplikasi desktop<span class="hint">Lampiran yang diunduh langsung dibuka di Excel/Word, bukan pratinjau web yang berat.</span></div>
+      <label class="switch"><input type="checkbox" data-key="attach_desktop"><span></span></label></div>
+    <div class="row"><div class="label">Hanya bila ukuran minimal (MB)<span class="hint">0 = semua ukuran. Boleh desimal, mis. 0.5.</span></div><input type="number" min="0" max="2000" step="0.1" data-key="attach_min_mb" data-decimal="1"></div>
+    <div class="row" style="display:block"><div class="label" style="margin-bottom:6px">Jenis file</div>
+      <div class="days">
+        <label><input type="checkbox" data-key="attach_excel"><b>Excel</b></label>
+        <label><input type="checkbox" data-key="attach_word"><b>Word</b></label>
+        <label><input type="checkbox" data-key="attach_ppt"><b>PowerPoint</b></label>
+        <label><input type="checkbox" data-key="attach_pdf"><b>PDF</b></label>
+      </div></div>
+    <div class="row"><div class="label">Klik lampiran = unduh &amp; buka di desktop<span class="tag">eksperimen</span><span class="hint">Lewati pratinjau web untuk jenis di atas. Ukuran dibaca dari tampilan Outlook bila ada.</span></div>
+      <label class="switch"><input type="checkbox" data-key="attach_intercept_preview"><span></span></label></div>
   </div>
 </details>
 
@@ -227,6 +258,7 @@
       <label class="switch"><input type="checkbox" data-key="diagnostics" data-menu="diag_ram"><span></span></label></div>
     <div class="btns">
       <button data-menu="diag_report">Buat laporan diagnostik</button>
+      <button data-menu="diag_copy">Salin laporan</button>
       <button data-menu="inspect">Diagnostik halaman Outlook</button>
     </div>
     <div class="row" style="display:block"><div class="label">Selector jumlah belum dibaca<span class="tag">lanjutan</span><span class="hint">Kosongkan untuk otomatis.</span></div>
@@ -280,9 +312,12 @@
     const key = el.dataset.key;
     if (!key) return;
     let value;
-    if (el.type === 'radio') { if (!el.checked) return; value = el.value; applyTheme(value); }
+    if (el.type === 'radio') { if (!el.checked) return; value = el.value; if (key === 'theme') applyTheme(value); }
     else if (el.type === 'checkbox') value = el.checked;
-    else if (el.type === 'number') { value = el.value === '' ? 0 : Math.round(+el.value); }
+    else if (el.type === 'number') {
+      const n = el.value === '' ? 0 : +el.value;
+      value = el.dataset.decimal ? Math.max(0, Math.round(n * 10) / 10) : Math.round(n);
+    }
     else if (key === 'unread_selector') value = el.value.trim() || null;
     else value = el.value;
     send({ t: 'set', key, value });

@@ -113,12 +113,28 @@ menambah RAM saat tidak dibuka.
   SHA-256. Versi baru aktif setelah restart.
 - **Single instance**: menjalankan exe lagi hanya menampilkan jendela yang ada.
 - Tautan di email dibuka di browser default Anda.
+- **Lampiran Office di aplikasi desktop** (Pengaturan > Lampiran): lampiran Excel/Word yang
+  diunduh langsung dibuka di Excel/Word (bawaan aktif; PowerPoint dan PDF bisa dinyalakan). Bisa
+  dibatasi ukuran minimal, mis. hanya file ≥ 1 MB (boleh desimal). Eksperimen *Klik lampiran = unduh
+  & buka di desktop* melewati pratinjau web yang berat untuk tabel besar.
+- **Penjaga stabilitas**:
+  - Halaman Outlook mati → dimuat ulang **di halaman yang sama**, dengan alasan (mis. kehabisan memori).
+  - WebView2 berhenti total → jendela yang terbuka dibuka lagi otomatis.
+  - Halaman macet saat jendela dipakai → Anda ditanya *muat ulang / tunggu* (tidak langsung dimuat
+    ulang). Saat tersembunyi → ditunggu 75 detik dulu, dan tidak pernah saat menulis email.
+  - Crash 3 kali dalam 10 menit → **mode aman**: fitur eksperimen dimatikan, muat ulang otomatis
+    dijeda, ditawari restart.
+  - Pratinjau Excel/Word/PowerPoint Online berjalan di proses sendiri, jadi bila pratinjau kehabisan
+    memori, Outlook tidak ikut tertutup.
+  - Windows dimatikan/restart tidak lagi tercatat sebagai "sesi berhenti tidak normal".
+  - Cek update yang gagal (internet belum siap) dicoba lagi 10 menit kemudian, maks. 3 kali.
+  - Bila 2 menit setelah start jumlah belum dibaca belum terbaca, dicatat di log & diberi tahu sekali.
 
 ## Hemat RAM
 
 | Keadaan | Yang dilakukan |
 |---|---|
-| Selalu | Tanpa GPU, tanpa service worker Outlook, V8 hemat memori, mode perangkat RAM kecil Chromium, tanpa proses renderer cadangan, tanpa cache halaman sebelumnya, tanpa layanan jaringan latar, iframe Microsoft berbagi proses dengan Outlook, telemetri Outlook/Office diblokir, autofill & simpan kata sandi WebView2 mati, tracking prevention mati, SmartScreen mati (API resmi), izin kamera/mikrofon/lokasi/sensor ditolak otomatis |
+| Selalu | GPU ringan (halaman digambar CPU), tanpa service worker Outlook, V8 hemat memori, maksimal 4 proses halaman, tanpa tebak-DNS, tanpa eksperimen jarak jauh & API iklan Chromium, tanpa proses renderer cadangan, tanpa cache halaman sebelumnya, tanpa layanan jaringan latar, iframe Microsoft berbagi proses dengan Outlook, telemetri Outlook/Office diblokir, autofill & simpan kata sandi WebView2 mati, tracking prevention mati, SmartScreen mati (API resmi), izin kamera/mikrofon/lokasi/sensor ditolak otomatis |
 | Tersembunyi | WebView2 sendiri menganggap halaman sedang kekurangan memori dan membersihkan cache & memori JavaScript |
 | Dipakai, tapi tidak difokus > 1 menit | WebView2 diminta memakai memori rendah; normal lagi saat jendela difokus |
 | Diminimalkan / di tray | Tampilan WebView2 dimatikan; **mode efisiensi** Windows (daun hijau di Task Manager), prioritas CPU dan memori rendah; RAM dicek tiap 30 detik dan dirapikan otomatis bila melewati 40 MB (paling sering tiap 60 detik, paling lambat tiap 5 menit), sekaligus memicu WebView2 membersihkan memori JavaScript; panel folder dibaca tiap 9 detik (email masuk tetap terdeteksi seketika) |
@@ -131,8 +147,12 @@ kembali saat dibutuhkan, jadi angka di Task Manager bisa naik perlahan lagi. Saa
 dibuka setelah lama di tray, tampilan pertama bisa terasa sedikit lebih lambat.
 
 Di menu **Jendela** (bawaan aktif):
-- **Tanpa GPU** (perlu restart): proses GPU turun dari ~70–90 MB ke ~13 MB. Gulir sedikit
-  kurang halus.
+- **GPU** Penuh / **Ringan** (bawaan) / Mati (perlu restart). Ringan: GPU hanya menyusun lapisan,
+  halaman digambar CPU, jadi hemat memori GPU tapi gulir tabel besar tetap halus. Mati paling hemat
+  (~13 MB) tapi gulir tabel besar berat.
+- **Mode RAM kecil Chromium** sekarang bawaan **mati** (sejak v0.1.16; dimatikan otomatis sekali
+  saat update): mode ini membuat Chromium mengira PC hanya ber-RAM ~512 MB sehingga pratinjau
+  lampiran besar bisa kehabisan memori dan Outlook dimuat ulang.
 - **Tanpa service worker Outlook**: menghapus satu proses (~30–45 MB) yang hanya dipakai
   Outlook untuk cache/offline. Outlook mungkin sedikit lebih lama terbuka pertama kali.
   Notifikasi tidak terpengaruh.
@@ -144,7 +164,10 @@ badge Outlook. Bandingkan hasilnya lewat laporan diagnostik.
 
 ## Privasi
 
-- Telemetri halaman Outlook web/Office diblokir di dalam WebView2.
+- Telemetri halaman Outlook web/Office diblokir di dalam WebView2, juga iklan MSN (`arc.msn.com`),
+  telemetri Excel Online, dan `js.monitor.azure.com` (opsi *Blokir iklan MSN & telemetri Excel/Azure*).
+- Eksperimen jarak jauh (field trial) dan API iklan Chromium (Topics, FLEDGE, Attribution Reporting,
+  Shared Storage) dimatikan.
 - SmartScreen WebView2 (cek reputasi alamat ke Microsoft) dimatikan.
 - Laporan crash WebView2 disimpan lokal (`%LOCALAPPDATA%\OutlookLite\WebView2`), tidak dikirim ke Microsoft.
 - Tracking prevention dimatikan: daftar pelacak tidak diunduh/dicek (aman karena hanya memuat Outlook).
@@ -157,8 +180,13 @@ badge Outlook. Bandingkan hasilnya lewat laporan diagnostik.
 
 1. Tray > Pengaturan > centang **Catat diagnostik (RAM & CPU tiap 30 detik)**.
 2. Pakai seperti biasa (buka, minimize, tutup ke tray) setidaknya 30–60 menit.
-3. Tray > Pengaturan > **Buat laporan diagnostik**. File `laporan-diagnostik.txt` terbuka di
-   Notepad dan Explorer. Kirim file itu.
+3. Tray > Pengaturan > **Buat laporan diagnostik** (file `laporan-diagnostik.txt` terbuka di
+   Notepad dan Explorer), atau **Salin laporan** lalu tempel (Ctrl+V) di chat.
+
+Tanpa menyalakan diagnostik pun, `outlook-lite.log` mencatat RAM & CPU tiap 10 menit, alasan
+setiap proses WebView2 yang berhenti (kehabisan memori, crash, macet, kode keluar, modul), dan
+laporan berisi daftar dump crash WebView2. Bila RAM saat jendela dipakai melewati 1000 MB
+(bisa diubah), muncul peringatan.
 
 Isi laporan: versi aplikasi, Windows, WebView2, RAM PC, pengaturan, ringkasan RAM/CPU per
 keadaan (dipakai, tak-fokus, minimize, tray, jeda), 300 baris log terakhir, dan data mentah
@@ -194,7 +222,7 @@ Di `%LOCALAPPDATA%\OutlookLite\settings.json`. Setelah diubah manual, pilih
   "trim_ws_mb": 40,
   "efficiency_mode": true,
   "block_telemetry": true,
-  "low_end_mode": true,
+  "low_end_mode": false,
   "theme": "system",
   "custom_environment": true,
   "tracking_prevention": false,
@@ -204,16 +232,30 @@ Di `%LOCALAPPDATA%\OutlookLite\settings.json`. Setelah diubah manual, pilih
   "refresh_hours": 8,
   "tray_mobile_ui": false,
   "site_isolation": false,
-  "no_gpu": true,
+  "gpu_mode": "lite",
+  "isolate_office": true,
+  "block_extra": true,
+  "disable_field_trials": true,
+  "unify_domain": false,
+  "memory_warn_mb": 1000,
+  "attach_desktop": true,
+  "attach_min_mb": 0.0,
+  "attach_excel": true,
+  "attach_word": true,
+  "attach_ppt": false,
+  "attach_pdf": false,
+  "attach_intercept_preview": false,
+  "settings_version": 16,
   "block_service_worker": true,
   "v8_optimize_for_size": true
 }
 ```
 
 `refresh_mb` / `refresh_ws_mb` / `refresh_hours` = 0 mematikan penyegaran otomatis. `trim_ws_mb` = 0
-hanya merapikan berkala. `low_end_mode` bisa membuat gulir terlihat sedikit kurang halus; set `false`
-bila mengganggu. `custom_environment` = false kembali ke cara lama membuat WebView2 (bila ada
-masalah). `site_isolation`, `no_gpu`, `low_end_mode`, `v8_optimize_for_size`, `custom_environment`,
+hanya merapikan berkala. `gpu_mode`: `full`, `lite`, atau `off`. `memory_warn_mb` = 0 mematikan
+peringatan RAM. `unify_domain` (eksperimen) memuat Outlook selalu dari `outlook.cloud.microsoft`.
+`custom_environment` = false kembali ke cara lama membuat WebView2 (bila ada
+masalah). `site_isolation`, `isolate_office`, `gpu_mode`, `disable_field_trials`, `unify_domain`, `low_end_mode`, `v8_optimize_for_size`, `custom_environment`,
 `tracking_prevention`, `local_crash_reports`, `simulate_memory_pressure`, `system_proxy_resolver`,
 dan `extra_browser_args` berlaku setelah aplikasi di-restart.
 

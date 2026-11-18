@@ -9,7 +9,6 @@
     all(not(debug_assertions), target_os = "windows"),
     windows_subsystem = "windows"
 )]
-
 #![cfg_attr(not(windows), allow(dead_code))]
 
 mod diag;
@@ -67,10 +66,151 @@ const TELEMETRY_HOSTS: &[&str] = &[
     "*.events.data.microsoft.com",
     "browser.pipe.aria.microsoft.com",
 ];
-/// Tanpa isolasi situs, iframe Microsoft lintas-domain berbagi proses dengan Outlook
-/// (lebih sedikit proses). Aman di sini karena WebView hanya memuat halaman Microsoft;
-/// tautan lain dibuka di browser default.
-const NO_SITE_ISOLATION: &str = "IsolateOrigins,site-per-process";
+/// Iklan/konten MSN dan telemetri Excel/Azure yang terlihat di log domain (tidak dibutuhkan email).
+const EXTRA_HOSTS: &[&str] = &[
+    "arc.msn.com",
+    "excel-telemetry.officeapps.live.com",
+    "js.monitor.azure.com",
+];
+/// TELEMETRY_HOSTS + EXTRA_HOSTS (daftar statis untuk WebView2).
+const ALL_BLOCKED_HOSTS: &[&str] = &[
+    "*.events.data.microsoft.com",
+    "browser.pipe.aria.microsoft.com",
+    "arc.msn.com",
+    "excel-telemetry.officeapps.live.com",
+    "js.monitor.azure.com",
+];
+/// Pratinjau lampiran Office (Excel/Word/PowerPoint Online). Diisolasi ke proses sendiri supaya
+/// tabel besar yang kehabisan memori tidak ikut mematikan halaman Outlook.
+const OFFICE_ORIGINS: &str = "https://excel.officeapps.live.com,https://word-view.officeapps.live.com,https://word-edit.officeapps.live.com,https://powerpoint.officeapps.live.com,https://view.officeapps.live.com";
+/// API iklan/pelacakan Chromium (Privacy Sandbox) yang tidak dipakai Outlook.
+const PRIVACY_SANDBOX_FEATURES: &str = "BrowsingTopics,BrowsingTopicsXHR,Fledge,InterestGroupStorage,PrivacySandboxAdsAPIs,PrivacySandboxAdsAPIsOverride,AttributionReportingCrossAppWeb,ConversionMeasurement,SharedStorageAPI";
+/// Batas jumlah proses halaman (Outlook + pratinjau). Lebih dari ini berbagi proses.
+const RENDERER_LIMIT: u32 = 4;
+/// Crash berulang: sebanyak ini dalam CRASH_WINDOW = mode aman.
+const CRASH_LIMIT: usize = 3;
+const CRASH_WINDOW: Duration = Duration::from_secs(10 * 60);
+/// Halaman tersembunyi macet: dimuat ulang bila tidak ada kabar selama ini.
+const HUNG_RELOAD_AFTER: Duration = Duration::from_secs(75);
+/// Catatan RAM/CPU di log biasa (walau diagnostik mati).
+const MEM_LOG_EVERY: Duration = Duration::from_secs(10 * 60);
+const MEM_WARN_EVERY: Duration = Duration::from_secs(30 * 60);
+/// Cek update gagal (mis. internet belum siap saat PC baru menyala): coba lagi segera.
+const UPDATE_RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
+const UPDATE_RETRY_MAX: u32 = 3;
+/// Bila jumlah belum dibaca belum terbaca selama ini sejak start, catat & beri tahu sekali.
+const HEALTH_CHECK_AFTER: Duration = Duration::from_secs(120);
+
+static UNIFY_DOMAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Alamat Outlook yang dipakai sesi ini (opsi "Satu alamat Outlook" → outlook.cloud.microsoft).
+fn site(url: &str) -> String {
+    if UNIFY_DOMAIN.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Some(rest) = url.strip_prefix("https://outlook.office.com/") {
+            return format!("https://outlook.cloud.microsoft/{rest}");
+        }
+    }
+    url.to_string()
+}
+
+/// Daftar dump crash WebView2 (folder Crashpad di data WebView2), terbaru dulu.
+fn crash_dumps_report(root: &Path) -> String {
+    fn walk(
+        dir: &Path,
+        depth: u32,
+        out: &mut Vec<(std::time::SystemTime, u64, String)>,
+        in_crashpad: bool,
+    ) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                if depth < 6 {
+                    walk(
+                        &p,
+                        depth + 1,
+                        out,
+                        in_crashpad || name.eq_ignore_ascii_case("Crashpad"),
+                    );
+                }
+            } else if in_crashpad && name.to_ascii_lowercase().ends_with(".dmp") {
+                let parent = p
+                    .parent()
+                    .and_then(|x| x.file_name())
+                    .map(|x| x.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                out.push((
+                    md.modified().unwrap_or(std::time::UNIX_EPOCH),
+                    md.len(),
+                    format!("{parent}/{name}"),
+                ));
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(root, 0, &mut found, false);
+    if found.is_empty() {
+        return "Tidak ada dump crash.\n".into();
+    }
+    found.sort_by_key(|x| std::cmp::Reverse(x.0));
+    let mut r = format!("{} dump crash (20 terbaru):\n", found.len());
+    for (t, len, name) in found.iter().take(20) {
+        let when: chrono::DateTime<Local> = (*t).into();
+        r.push_str(&format!(
+            "{}  {:>6.1} MB  {name}\n",
+            when.format("%Y-%m-%d %H:%M"),
+            *len as f64 / (1024.0 * 1024.0)
+        ));
+    }
+    r
+}
+
+/// Alasan kegagalan proses WebView2 (COREWEBVIEW2_PROCESS_FAILED_REASON).
+fn failure_reason(reason: i32) -> &'static str {
+    match reason {
+        0 => "tak terduga",
+        1 => "tidak merespons",
+        2 => "dihentikan",
+        3 => "crash",
+        4 => "gagal dijalankan",
+        5 => "kehabisan memori",
+        6 => "profil dihapus",
+        _ => "tidak diketahui",
+    }
+}
+
+/// Jenis lampiran dinyalakan di Pengaturan > Lampiran?
+fn attach_type_on(s: &Settings, ext: &str) -> bool {
+    match ext {
+        "xlsx" | "xls" | "xlsm" | "xlsb" | "csv" => s.attach_excel,
+        "docx" | "doc" | "docm" | "rtf" => s.attach_word,
+        "pptx" | "ppt" | "pptm" | "ppsx" => s.attach_ppt,
+        "pdf" => s.attach_pdf,
+        _ => false,
+    }
+}
+
+/// Unduhan ini langsung dibuka di aplikasi desktop?
+fn attach_should_open(s: &Settings, ext: &str, size_mb: f64) -> bool {
+    s.attach_desktop && attach_type_on(s, ext) && size_mb + 1e-9 >= s.attach_min_mb
+}
+
+fn blocked_hosts_for(s: &Settings) -> &'static [&'static str] {
+    match (s.block_telemetry, s.block_extra) {
+        (true, true) => ALL_BLOCKED_HOSTS,
+        (true, false) => TELEMETRY_HOSTS,
+        (false, true) => EXTRA_HOSTS,
+        (false, false) => &[],
+    }
+}
+/// Tanpa isolasi situs (`site-per-process` mati), iframe Microsoft lintas-domain berbagi proses
+/// dengan Outlook (lebih sedikit proses). Aman di sini karena WebView hanya memuat halaman
+/// Microsoft; tautan lain dibuka di browser default. Pratinjau Office tetap diisolasi
+/// (lihat OFFICE_ORIGINS).
 /// Izinkan Outlook membunyikan suara email masuk tanpa klik pengguna (seperti PWA).
 const AUTOPLAY_ARGS: &str = "--autoplay-policy=no-user-gesture-required";
 /// Jangan perlambat halaman tersembunyi (penting untuk notifikasi di mode Siaga).
@@ -131,8 +271,10 @@ enum UserEvent {
     PageLoaded(String),
     ToastClick(Option<u64>),
     Update(update::Outcome, bool),
-    /// Proses WebView2 mati/macet (jenis kegagalan WebView2).
-    ProcessFailed(i32),
+    /// Proses WebView2 mati/macet: jenis, alasan, detail (kode keluar, proses, modul).
+    ProcessFailed(i32, i32, String),
+    /// Unduhan selesai: (alamat, file, berhasil).
+    Download(String, Option<PathBuf>, bool),
     /// Navigasi halaman utama selesai (berhasil, status error WebView2).
     NavDone(bool, i32),
     /// Pesan dari jendela Pengaturan.
@@ -155,10 +297,19 @@ enum PageMsg {
         /// Pembacaan yang diminta aplikasi (email masuk / Cek email sekarang).
         force: bool,
     },
-    Notify { id: u64, title: String, body: String },
+    Notify {
+        id: u64,
+        title: String,
+        body: String,
+    },
     Badge(i64),
     Sound,
     Inspect(String),
+    /// Lampiran diklik dalam mode "klik = unduh & buka di desktop" (nama file, perkiraan MB).
+    Attach {
+        name: String,
+        mb: Option<f64>,
+    },
 }
 
 fn clean(s: &str, max: usize) -> String {
@@ -176,7 +327,10 @@ fn parse_page_msg(body: &str) -> Option<PageMsg> {
     match v.get("t")?.as_str()? {
         "state" => Some(PageMsg::State {
             unread: v.get("unread")?.as_i64()?,
-            composing: v.get("composing").and_then(|c| c.as_bool()).unwrap_or(false),
+            composing: v
+                .get("composing")
+                .and_then(|c| c.as_bool())
+                .unwrap_or(false),
             how: s("how", 24),
             force: v.get("force").and_then(|c| c.as_bool()).unwrap_or(false),
         }),
@@ -185,8 +339,17 @@ fn parse_page_msg(body: &str) -> Option<PageMsg> {
             title: s("title", 300),
             body: s("body", 600),
         }),
-        "badge" => Some(PageMsg::Badge(v.get("count")?.as_i64()?.clamp(0, 1_000_000))),
+        "badge" => Some(PageMsg::Badge(
+            v.get("count")?.as_i64()?.clamp(0, 1_000_000),
+        )),
         "sound" => Some(PageMsg::Sound),
+        "attach" => Some(PageMsg::Attach {
+            name: s("name", 260),
+            mb: v
+                .get("mb")
+                .and_then(|x| x.as_f64())
+                .filter(|x| x.is_finite() && *x >= 0.0),
+        }),
         "inspect" => Some(PageMsg::Inspect(
             v.get("data")?.as_str()?.chars().take(300_000).collect(),
         )),
@@ -392,10 +555,26 @@ fn browser_args_for(s: &Settings, started_in_tray: bool) -> String {
         extra.push_str(" --edge-webview-is-background");
     }
     if !s.site_isolation {
-        features.push(',');
-        features.push_str(NO_SITE_ISOLATION);
-        extra.push_str(" --disable-site-isolation-trials");
+        // Tanpa isolasi per situs (lebih sedikit proses)...
+        features.push_str(",site-per-process");
+        if s.isolate_office {
+            // ...kecuali pratinjau Office: proses sendiri, sehingga Excel/Word Online yang
+            // kehabisan memori tidak ikut mematikan Outlook.
+            extra.push_str(&format!(" --isolate-origins={OFFICE_ORIGINS}"));
+        } else {
+            features.push_str(",IsolateOrigins");
+            extra.push_str(" --disable-site-isolation-trials");
+        }
     }
+    if s.disable_field_trials {
+        // Eksperimen jarak jauh Microsoft/Chromium & API iklan tidak dipakai Outlook.
+        features.push(',');
+        features.push_str(PRIVACY_SANDBOX_FEATURES);
+        extra.push_str(" --disable-field-trial-config");
+    }
+    // Tanpa tebak-DNS domain dari tautan di email (lalu lintas & CPU kecil tambahan).
+    extra.push_str(" --dns-prefetch-disable");
+    extra.push_str(&format!(" --renderer-process-limit={RENDERER_LIMIT}"));
     // Tanpa layanan jaringan latar Chromium (pembaruan komponen, dsb.).
     extra.push_str(" --disable-background-networking");
     if s.low_end_mode {
@@ -412,8 +591,12 @@ fn browser_args_for(s: &Settings, started_in_tray: bool) -> String {
 /// Argumen WebView2 lengkap (termasuk GPU & argumen tambahan) untuk pengaturan `s`.
 fn full_browser_args(s: &Settings, started_in_tray: bool) -> String {
     let mut a = browser_args_for(s, started_in_tray);
-    if s.no_gpu {
-        a.push_str(" --disable-gpu");
+    match s.gpu_mode.as_str() {
+        "off" => a.push_str(" --disable-gpu"),
+        // Ringan: GPU hanya menyusun lapisan; halaman digambar CPU (hemat memori GPU, gulir
+        // tetap halus — tidak seperti GPU mati yang membuat tabel besar berat digulir).
+        "lite" => a.push_str(" --disable-gpu-rasterization"),
+        _ => {}
     }
     if !s.extra_browser_args.trim().is_empty() {
         a.push(' ');
@@ -431,10 +614,17 @@ fn data_dir() -> PathBuf {
 
 fn log(dir: &Path, msg: &str) {
     let p = dir.join("outlook-lite.log");
-    if std::fs::metadata(&p).map(|m| m.len() > 256 * 1024).unwrap_or(false) {
+    if std::fs::metadata(&p)
+        .map(|m| m.len() > 256 * 1024)
+        .unwrap_or(false)
+    {
         let _ = std::fs::rename(&p, dir.join("outlook-lite.old.log"));
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&p)
+    {
         let _ = writeln!(f, "{} {msg}", Local::now().format("%Y-%m-%d %H:%M:%S"));
     }
 }
@@ -507,6 +697,7 @@ mod id {
     pub const NO_GPU: &str = "no_gpu";
     pub const NO_SW: &str = "no_sw";
     pub const DIAG_REPORT: &str = "diag_report";
+    pub const DIAG_COPY: &str = "diag_copy";
     pub const ZOOM_IN: &str = "zoom_in";
     pub const ZOOM_OUT: &str = "zoom_out";
     pub const ZOOM_RESET: &str = "zoom_reset";
@@ -552,7 +743,13 @@ fn build_menu(_s: &Settings) -> Result<(Menu, TrayMenu), tray_icon::menu::Error>
         &item(id::QUIT, "Keluar"),
     ])?;
 
-    Ok((menu, TrayMenu { status, restart_update }))
+    Ok((
+        menu,
+        TrayMenu {
+            status,
+            restart_update,
+        },
+    ))
 }
 
 /// Kombinasi cadangan bila hotkey bawaan sudah dipakai aplikasi lain.
@@ -685,6 +882,34 @@ struct App {
 
     initial_url: Option<String>,
     exiting: bool,
+    guard: Guard,
+}
+
+/// Keadaan penjaga stabilitas (crash, macet, memori, update, kesehatan start).
+#[derive(Default)]
+struct Guard {
+    /// Waktu proses Outlook mati (untuk deteksi crash berulang).
+    crash_times: Vec<Instant>,
+    /// Mode aman aktif: tidak ada muat ulang/buat ulang otomatis sampai waktu ini.
+    hold_until: Option<Instant>,
+    safe_mode: bool,
+    last_unresp_ask: Option<Instant>,
+    /// Halaman tersembunyi dilaporkan macet sejak.
+    hung_at: Option<Instant>,
+    /// Kabar terakhir dari halaman (monitor.js mengirim minimal tiap 60 detik).
+    last_state_at: Option<Instant>,
+    /// Buka lagi jendela di alamat ini setelah proses inti WebView2 mati.
+    reopen: Option<(Instant, String)>,
+    last_mem_log: Option<Instant>,
+    mem_warned_at: Option<Instant>,
+    update_retry_at: Option<Instant>,
+    update_retries: u32,
+    health_done: bool,
+    mem_check_at: Option<Instant>,
+    /// Pengukur CPU untuk catatan log 10 menit (terpisah dari diagnostik).
+    log_sampler: Option<diag::Sampler>,
+    /// Lampiran yang diklik (mode eksperimen): nama file & perkiraan ukuran MB.
+    attach_click: Option<(String, Option<f64>, Instant)>,
 }
 
 impl App {
@@ -713,7 +938,14 @@ impl App {
         self.toast3(title, body, "", click, force_sound);
     }
 
-    fn toast3(&self, title: &str, body: &str, body2: &str, click: Option<u64>, force_sound: Option<bool>) {
+    fn toast3(
+        &self,
+        title: &str,
+        body: &str,
+        body2: &str,
+        click: Option<u64>,
+        force_sound: Option<bool>,
+    ) {
         let proxy = self.proxy.clone();
         let cb: win::Callback = Arc::new(move || {
             let _ = proxy.send_event(UserEvent::ToastClick(click));
@@ -752,7 +984,10 @@ impl App {
             });
         }
         if let Some(r) = &self.last_row {
-            parts.push(format!("RAM {:.0} MB, CPU {:.1}% ({} proses)", r.ram_mb, r.cpu, r.procs));
+            parts.push(format!(
+                "RAM {:.0} MB, CPU {:.1}% ({} proses)",
+                r.ram_mb, r.cpu, r.procs
+            ));
         }
         parts.join(" • ")
     }
@@ -766,7 +1001,10 @@ impl App {
             Badge::None
         };
         let status = self.status_text();
-        let tip: String = format!("Outlook Lite — {status}").chars().take(120).collect();
+        let tip: String = format!("Outlook Lite — {status}")
+            .chars()
+            .take(120)
+            .collect();
         if let Some(t) = &self.tray {
             if badge != self.badge {
                 let _ = t.set_icon(tray_image(badge));
@@ -789,7 +1027,8 @@ impl App {
                 {
                     use tao::platform::windows::WindowExtWindows;
                     let img = WindowIcon::from_rgba(icon::dot(32), 32, 32).ok();
-                    i.window.set_overlay_icon(if has_unread { img.as_ref() } else { None });
+                    i.window
+                        .set_overlay_icon(if has_unread { img.as_ref() } else { None });
                 }
                 self.overlay_on = has_unread;
             }
@@ -885,7 +1124,11 @@ impl App {
                 continue; // dimatikan oleh pengguna
             }
             // Coba kombinasi yang diatur dulu, lalu cadangan bila bentrok dengan aplikasi lain.
-            let alts: &[&str] = if is_toggle { &TOGGLE_ALTS } else { &COMPOSE_ALTS };
+            let alts: &[&str] = if is_toggle {
+                &TOGGLE_ALTS
+            } else {
+                &COMPOSE_ALTS
+            };
             let mut candidates = vec![configured.clone()];
             candidates.extend(
                 alts.iter()
@@ -1014,9 +1257,28 @@ impl App {
             }
         };
 
+        let st = &self.settings;
+        let mut att_types: Vec<&str> = Vec::new();
+        if st.attach_excel {
+            att_types.extend(["xlsx", "xls", "xlsm", "xlsb", "csv"]);
+        }
+        if st.attach_word {
+            att_types.extend(["docx", "doc", "docm", "rtf"]);
+        }
+        if st.attach_ppt {
+            att_types.extend(["pptx", "ppt", "pptm", "ppsx"]);
+        }
+        if st.attach_pdf {
+            att_types.push("pdf");
+        }
         let cfg = serde_json::json!({
-            "sel": self.settings.unread_selector,
-            "nosw": self.settings.block_service_worker,
+            "sel": st.unread_selector,
+            "nosw": st.block_service_worker,
+            // Eksperimen: klik lampiran = unduh lalu buka di aplikasi desktop.
+            "att": (st.attach_desktop && st.attach_intercept_preview).then(|| serde_json::json!({
+                "types": att_types,
+                "min": st.attach_min_mb,
+            })),
         });
         let init_js = format!("window.__oliteCfg = {cfg};\n{MONITOR_JS}");
         let zoom = self.settings.zoom;
@@ -1028,10 +1290,11 @@ impl App {
         let custom_env = self.webview_env();
         let proxy_ipc = self.proxy.clone();
         let proxy_load = self.proxy.clone();
+        let proxy_dl = self.proxy.clone();
         let mobile = !visible && self.settings.tray_mobile_ui;
 
         let builder = WebViewBuilder::new_with_web_context(&mut self.web_context)
-            .with_url(url)
+            .with_url(site(url))
             .with_initialization_script(init_js)
             .with_ipc_handler(move |req| {
                 // Hanya terima pesan dari halaman Outlook web.
@@ -1046,6 +1309,11 @@ impl App {
                 if matches!(ev, PageLoadEvent::Finished) {
                     let _ = proxy_load.send_event(UserEvent::PageLoaded(url));
                 }
+            })
+            // Unduhan tetap memakai tampilan unduhan WebView2 biasa; setelah selesai, lampiran
+            // Office bisa langsung dibuka di aplikasi desktop (Pengaturan > Lampiran).
+            .with_download_completed_handler(move |uri, path, ok| {
+                let _ = proxy_dl.send_event(UserEvent::Download(uri, path, ok));
             })
             .with_new_window_req_handler(|url, _features| {
                 if url.starts_with("about:") || is_microsoft_url(&url) {
@@ -1091,14 +1359,11 @@ impl App {
             }
         };
         let _ = webview.zoom(zoom);
-        win::tune_webview(
-            &webview,
-            if self.settings.block_telemetry { TELEMETRY_HOSTS } else { &[] },
-        );
+        win::tune_webview(&webview, blocked_hosts_for(&self.settings));
         {
             let p = self.proxy.clone();
-            win::on_process_failed(&webview, move |k| {
-                let _ = p.send_event(UserEvent::ProcessFailed(k));
+            win::on_process_failed(&webview, move |k, r, d| {
+                let _ = p.send_event(UserEvent::ProcessFailed(k, r, d));
             });
             let p = self.proxy.clone();
             win::on_navigation_completed(&webview, move |ok, status| {
@@ -1169,7 +1434,7 @@ impl App {
         }
         if let Some(inst) = self.inst.as_mut() {
             if let Some(u) = url {
-                let _ = inst.webview.load_url(u);
+                let _ = inst.webview.load_url(&site(u));
             }
             if !inst.visible || inst.minimized || inst.window.is_minimized() {
                 let from = if inst.visible { "minimize" } else { "tray" };
@@ -1228,7 +1493,7 @@ impl App {
                 // dimuat saat tersembunyi digambar dulu lewat render hangat (on_page_loaded).
                 let _ = inst.webview.set_visible(false);
                 if !inst.webview.url().is_ok_and(|u| is_outlook_url(&u)) {
-                    let _ = inst.webview.load_url(MAIL_URL);
+                    let _ = inst.webview.load_url(&site(MAIL_URL));
                 }
                 if self.settings.low_memory {
                     set_memory_low(&inst.webview, true);
@@ -1285,7 +1550,9 @@ impl App {
     fn on_resized(&mut self) {
         let jeda = self.active_mode() == Mode::Jeda;
         let low = self.settings.low_memory;
-        let Some(inst) = self.inst.as_mut() else { return };
+        let Some(inst) = self.inst.as_mut() else {
+            return;
+        };
         if inst.window.is_minimized() {
             if !inst.minimized {
                 inst.minimized = true;
@@ -1369,7 +1636,7 @@ impl App {
                             .evaluate_script("window.__oliteForce && window.__oliteForce()");
                     } else {
                         // Tersembunyi di Kalender/Kontak: kembali ke Email lalu hitung.
-                        let _ = inst.webview.load_url(MAIL_URL);
+                        let _ = inst.webview.load_url(&site(MAIL_URL));
                     }
                 }
                 // Halaman Email: harus menjawab cepat; kalau tidak, dimuat ulang (lihat tick).
@@ -1417,7 +1684,11 @@ impl App {
         if self.warm_until.take().is_none() {
             return;
         }
-        let secs = self.warm_started.take().map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        let secs = self
+            .warm_started
+            .take()
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0);
         if let Some(inst) = &self.inst {
             if !inst.visible {
                 let _ = inst.webview.set_visible(false);
@@ -1443,44 +1714,245 @@ impl App {
         } else {
             "Tidak ada email belum dibaca di Inbox.".into()
         };
-        self.toast(
-            "Outlook Lite",
-            &body,
-            None,
-            Some(false),
-        );
+        self.toast("Outlook Lite", &body, None, Some(false));
         self.log(&format!("cek email: memakai angka terakhir {n} ({why})"));
         self.diag_note(&format!("cek email: angka terakhir {n} ({why})"));
         true
     }
 
-    fn on_process_failed(&mut self, kind: i32) {
+    fn on_process_failed(
+        &mut self,
+        target: &EventLoopWindowTarget<UserEvent>,
+        kind: i32,
+        reason: i32,
+        detail: String,
+    ) {
+        let now = Instant::now();
         let what = match kind {
             0 => "proses inti WebView2 berhenti",
             1 => "proses halaman Outlook berhenti",
             2 => "halaman Outlook tidak merespons",
             3 => "proses bingkai halaman berhenti",
             4 => "proses utility WebView2 berhenti",
+            5 => "proses bingkai halaman berhenti",
             6 => "proses GPU WebView2 berhenti",
+            7 => "proses PPAPI berhenti",
             _ => "proses WebView2 lain berhenti",
         };
-        self.log(&format!("WebView2: {what} (jenis {kind})"));
-        self.diag_note(&format!("WebView2 gagal: {what}"));
+        let why = failure_reason(reason);
+        let (visible, minimized) = self
+            .inst
+            .as_ref()
+            .map_or((false, false), |i| (i.visible, i.minimized));
+        let url = self
+            .inst
+            .as_ref()
+            .and_then(|i| i.webview.url().ok())
+            .filter(|u| is_outlook_url(u));
+        self.log(&format!(
+            "WebView2: {what} (jenis {kind}, alasan {reason} {why}){}{} — jendela {}{}",
+            if detail.is_empty() { "" } else { " " },
+            detail,
+            if !visible {
+                "tersembunyi"
+            } else if minimized {
+                "diminimalkan"
+            } else {
+                "terbuka"
+            },
+            if self.composing {
+                ", sedang menulis email"
+            } else {
+                ""
+            },
+        ));
+        self.diag_note(&format!("WebView2 gagal: {what} ({why})"));
+
+        // Proses yang benar-benar mati (bukan macet) dihitung untuk deteksi crash berulang.
+        if matches!(kind, 0 | 1) {
+            self.guard
+                .crash_times
+                .retain(|t| now.duration_since(*t) < CRASH_WINDOW);
+            self.guard.crash_times.push(now);
+            if self.guard.crash_times.len() >= CRASH_LIMIT && !self.guard.safe_mode {
+                self.enter_safe_mode(kind);
+                return;
+            }
+        }
+        let held = self.guard.hold_until.is_some_and(|t| now < t);
+
         match kind {
-            // Proses inti mati: WebView tidak bisa dipakai lagi, buat ulang di tick berikutnya
-            // (Siaga membuat Outlook tersembunyi baru otomatis).
+            // Proses inti mati: WebView tidak bisa dipakai lagi. Jendela yang sedang terbuka
+            // dibuka lagi di halaman yang sama; Outlook tersembunyi dibuat ulang oleh tick.
             0 => {
                 self.destroy_instance();
+                if visible && !held {
+                    let u = url.unwrap_or_else(|| MAIL_URL.to_string());
+                    self.guard.reopen = Some((now + Duration::from_secs(3), u));
+                    self.next_tick = self.next_tick.min(now + Duration::from_secs(3));
+                    self.toast(
+                        "Outlook dibuka ulang",
+                        &format!("WebView2 berhenti ({why}). Outlook dibuka lagi otomatis."),
+                        None,
+                        Some(false),
+                    );
+                }
                 self.refresh_tray();
             }
-            // Halaman mati/macet: muat ulang Outlook.
-            1 | 2 => {
-                if let Some(inst) = &self.inst {
-                    let _ = inst.webview.load_url(MAIL_URL);
+            // Halaman mati: muat ulang halaman yang sama (bukan kembali ke Inbox).
+            1 => {
+                if held {
+                    return;
                 }
-                self.settle_until = Some(Instant::now() + REFRESH_SETTLE);
+                if let Some(inst) = &self.inst {
+                    match &url {
+                        Some(u) => {
+                            let _ = inst.webview.load_url(u);
+                        }
+                        None => {
+                            let _ = inst.webview.load_url(&site(MAIL_URL));
+                        }
+                    }
+                }
+                self.settle_until = Some(now + REFRESH_SETTLE);
+                self.guard.hung_at = None;
+                if visible {
+                    let tip = if reason == 5 {
+                        "Halaman kehabisan memori (mis. pratinjau lampiran besar) dan dimuat ulang.                          Lampiran besar lebih ringan dibuka di Excel/Word desktop."
+                    } else {
+                        "Halaman Outlook berhenti dan sudah dimuat ulang."
+                    };
+                    self.toast("Outlook dimuat ulang", tip, None, Some(false));
+                }
+            }
+            // Macet: jangan langsung dimuat ulang (bisa pulih sendiri, dan draf bisa hilang).
+            2 => {
+                if visible && !minimized {
+                    let asked_recent = self
+                        .guard
+                        .last_unresp_ask
+                        .is_some_and(|t| now.duration_since(t) < Duration::from_secs(60));
+                    if !asked_recent {
+                        self.guard.last_unresp_ask = Some(now);
+                        let draft = if self.composing {
+                            "\n\nPerhatian: ada email yang sedang ditulis; memuat ulang bisa menghilangkan draf yang belum tersimpan."
+                        } else {
+                            ""
+                        };
+                        if win::confirm(&format!(
+                            "Outlook tidak merespons.\n\nYa = muat ulang sekarang\nTidak = tunggu sebentar{draft}"
+                        )) {
+                            self.log("halaman macet: dimuat ulang atas pilihan pengguna");
+                            if let Some(inst) = &self.inst {
+                                let _ = inst.webview.reload();
+                            }
+                            self.settle_until = Some(Instant::now() + REFRESH_SETTLE);
+                        } else {
+                            self.log("halaman macet: pengguna memilih menunggu");
+                        }
+                    }
+                } else if self.guard.hung_at.is_none() {
+                    // Tersembunyi: tunggu; dimuat ulang oleh tick bila tetap tanpa kabar.
+                    self.guard.hung_at = Some(now);
+                    self.next_tick = self.next_tick.min(now + HUNG_RELOAD_AFTER);
+                }
             }
             _ => {}
+        }
+        let _ = target;
+    }
+
+    /// Crash berulang: hentikan muat ulang otomatis, matikan fitur eksperimen, tawarkan restart.
+    fn enter_safe_mode(&mut self, kind: i32) {
+        let now = Instant::now();
+        self.guard.safe_mode = true;
+        self.guard.hold_until = Some(now + CRASH_WINDOW);
+        let s = &mut self.settings;
+        let mut off: Vec<&str> = Vec::new();
+        if s.low_end_mode {
+            s.low_end_mode = false;
+            off.push("mode RAM kecil");
+        }
+        if s.v8_optimize_for_size {
+            s.v8_optimize_for_size = false;
+            off.push("JavaScript hemat memori");
+        }
+        if s.simulate_memory_pressure {
+            s.simulate_memory_pressure = false;
+            off.push("bersih-bersih memori WebView2");
+        }
+        if s.custom_environment {
+            s.custom_environment = false;
+            off.push("WebView2 disiapkan sendiri");
+        }
+        if s.tray_mobile_ui {
+            s.tray_mobile_ui = false;
+            off.push("tampilan mobile di tray");
+        }
+        if s.gpu_mode == "off" {
+            s.gpu_mode = "lite".into();
+            off.push("GPU mati → ringan");
+        }
+        self.save();
+        let list = if off.is_empty() {
+            "-".to_string()
+        } else {
+            off.join(", ")
+        };
+        self.log(&format!(
+            "MODE AMAN: {} kali crash dalam 10 menit; muat ulang otomatis dijeda 10 menit; dimatikan: {list}",
+            self.guard.crash_times.len()
+        ));
+        self.diag_note("mode aman");
+        // Halaman yang mati tetap dibiarkan; Outlook tersembunyi tidak dibuat ulang sampai jeda habis.
+        if kind == 0 {
+            self.destroy_instance();
+        }
+        self.refresh_tray();
+        self.push_settings_state();
+        if win::confirm(&format!(
+            "Outlook Lite berhenti {} kali dalam 10 menit.\n\n\
+             Mode aman aktif: fitur eksperimen dimatikan ({list}) dan muat ulang otomatis dijeda.\n\n\
+             Restart Outlook Lite sekarang?",
+            self.guard.crash_times.len()
+        )) {
+            self.restart();
+        }
+    }
+
+    /// Unduhan selesai: lampiran Office dibuka di aplikasi desktop bila diatur begitu.
+    fn on_download(&mut self, uri: String, path: Option<PathBuf>, ok: bool) {
+        let _ = uri;
+        let Some(path) = path.filter(|_| ok) else {
+            return;
+        };
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let mb = size as f64 / (1024.0 * 1024.0);
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        let clicked = self
+            .guard
+            .attach_click
+            .take()
+            .filter(|(_, _, t)| t.elapsed() < Duration::from_secs(120));
+        let open = attach_should_open(&self.settings, &ext, mb)
+            || clicked.is_some_and(|(n, _, _)| {
+                // Unduhan dari klik lampiran (eksperimen): dibuka bila jenisnya cocok.
+                path.file_name().is_some_and(|f| f.to_string_lossy() == n)
+                    && attach_type_on(&self.settings, &ext)
+            });
+        self.log(&format!(
+            "unduhan selesai: .{ext} {mb:.1} MB{}",
+            if open {
+                " → dibuka di aplikasi desktop"
+            } else {
+                ""
+            }
+        ));
+        if open {
+            win::open_file(&path);
         }
     }
 
@@ -1504,7 +1976,11 @@ impl App {
         if !self.net.failing() {
             let msg = format!(
                 "Outlook gagal dimuat: tidak ada koneksi (status {status}, Windows: {})",
-                if win::is_online() { "online" } else { "offline" }
+                if win::is_online() {
+                    "online"
+                } else {
+                    "offline"
+                }
             );
             self.log(&msg);
             self.diag_note(&msg);
@@ -1541,7 +2017,7 @@ impl App {
                     self.log("koneksi: memuat ulang Outlook");
                     self.diag_note("koneksi: muat ulang");
                     if let Some(inst) = &self.inst {
-                        let _ = inst.webview.load_url(MAIL_URL);
+                        let _ = inst.webview.load_url(&site(MAIL_URL));
                     }
                     self.settle_until = Some(now + REFRESH_SETTLE);
                 }
@@ -1585,7 +2061,9 @@ impl App {
                 Ok(env) => Some(env),
                 Err(e) => {
                     // Cadangan: cara lama (environment dibuat wry). Outlook tetap jalan.
-                    self.log(&format!("environment WebView2 sendiri gagal, pakai cara lama: {e}"));
+                    self.log(&format!(
+                        "environment WebView2 sendiri gagal, pakai cara lama: {e}"
+                    ));
                     None
                 }
             }
@@ -1695,6 +2173,7 @@ impl App {
     fn restart_needed(&self) -> bool {
         full_browser_args(&self.settings, self.started_tray) != self.browser_args
             || EnvOpts::of(&self.settings) != self.env_opts
+            || self.settings.unify_domain != UNIFY_DOMAIN.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Kirim keadaan terbaru ke jendela Pengaturan.
@@ -1783,7 +2262,15 @@ impl App {
                 self.leave_background_mode()
             }
             // Dipasang saat Outlook dibuat: muat ulang Outlook.
-            "block_telemetry" | "unread_selector" => self.recreate_instance(target),
+            "block_telemetry" | "block_extra" | "unread_selector" => self.recreate_instance(target),
+            // Skrip klik lampiran (eksperimen) dipasang saat Outlook dibuat.
+            "attach_intercept_preview" => self.recreate_instance(target),
+            "attach_desktop" | "attach_excel" | "attach_word" | "attach_ppt" | "attach_pdf"
+            | "attach_min_mb"
+                if self.settings.attach_intercept_preview =>
+            {
+                self.recreate_instance(target)
+            }
             "shortcuts" => self.build_tray(),
             "theme" => self.apply_theme(),
             _ => {}
@@ -1836,7 +2323,11 @@ impl App {
         let src = format!(
             "inbox={} ({}) badge={}",
             self.unread.map_or("?".into(), |n| n.to_string()),
-            if self.unread_how.is_empty() { "-" } else { &self.unread_how },
+            if self.unread_how.is_empty() {
+                "-"
+            } else {
+                &self.unread_how
+            },
             self.badge_unread.map_or("?".into(), |n| n.to_string())
         );
         if src != self.last_unread_note {
@@ -1883,6 +2374,63 @@ impl App {
     /// Satu file berisi semua yang dibutuhkan untuk perbaikan: versi, sistem, pengaturan,
     /// ringkasan RAM/CPU per keadaan, log, dan data mentah. Tanpa isi email.
     fn write_report(&mut self) {
+        let r = self.build_report();
+        let path = self.dir.join("laporan-diagnostik.txt");
+        let _ = std::fs::create_dir_all(&self.dir);
+        match std::fs::write(&path, r) {
+            Ok(()) => {
+                win::reveal_file(&path);
+                win::open_in_notepad(&path);
+                if !self.settings.diagnostics {
+                    self.toast(
+                        "Laporan dibuat",
+                        "Catat diagnostik belum aktif: aktifkan dulu agar laporan berisi data RAM & CPU.",
+                        None,
+                        Some(false),
+                    );
+                }
+            }
+            Err(e) => self.log(&format!("laporan gagal: {e}")),
+        }
+    }
+
+    /// Buat laporan lalu salin ke clipboard (tinggal tempel di chat).
+    fn copy_report(&mut self) {
+        let r = self.build_report();
+        let _ = std::fs::create_dir_all(&self.dir);
+        let _ = std::fs::write(self.dir.join("laporan-diagnostik.txt"), &r);
+        // Clipboard tidak cocok untuk teks sangat besar: data mentah dipotong.
+        let text = if r.len() > 900_000 {
+            let mut cut = 900_000;
+            while !r.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!(
+                "{}\n…(dipotong; lengkapnya di laporan-diagnostik.txt)",
+                &r[..cut]
+            )
+        } else {
+            r
+        };
+        if win::set_clipboard_text(&text) {
+            self.toast(
+                "Laporan disalin",
+                "Laporan diagnostik ada di clipboard. Tempel (Ctrl+V) di chat.",
+                None,
+                Some(false),
+            );
+        } else {
+            self.log("salin laporan ke clipboard gagal");
+            self.toast(
+                "Gagal menyalin",
+                "Clipboard sedang dipakai aplikasi lain. Coba lagi, atau pakai Buat laporan diagnostik.",
+                None,
+                Some(false),
+            );
+        }
+    }
+
+    fn build_report(&mut self) -> String {
         use std::fmt::Write as _;
         if self.settings.diagnostics {
             self.diag_note("laporan dibuat");
@@ -1901,7 +2449,9 @@ impl App {
         let _ = writeln!(
             r,
             "CPU logis: {}",
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(0)
         );
         r.push_str(&win::system_info());
         let _ = writeln!(r, "Keadaan sekarang: {}", self.diag_state_now().label());
@@ -1928,7 +2478,10 @@ impl App {
         }
         let _ = writeln!(r);
 
-        let _ = writeln!(r, "== Domain yang dihubungi WebView2 (jumlah permintaan) ==");
+        let _ = writeln!(
+            r,
+            "== Domain yang dihubungi WebView2 (jumlah permintaan) =="
+        );
         diag::flush_domains(&self.dir);
         r.push_str(&diag::domains_report(&self.dir));
         let _ = writeln!(r);
@@ -1936,7 +2489,11 @@ impl App {
         let _ = writeln!(r, "== Pengaturan ==");
         let mut st = self.settings.clone();
         st.window = None;
-        let _ = writeln!(r, "{}", serde_json::to_string_pretty(&st).unwrap_or_default());
+        let _ = writeln!(
+            r,
+            "{}",
+            serde_json::to_string_pretty(&st).unwrap_or_default()
+        );
         let _ = writeln!(r);
 
         let _ = writeln!(r, "== Log (300 baris terakhir) ==");
@@ -1952,30 +2509,168 @@ impl App {
         }
         let _ = writeln!(r);
 
+        let _ = writeln!(r, "== Laporan crash WebView2 (disimpan lokal) ==");
+        r.push_str(&crash_dumps_report(&self.dir.join("WebView2")));
+        let _ = writeln!(r);
+
         let _ = writeln!(r, "== Data mentah (1000 sampel terakhir) ==");
         let _ = writeln!(r, "{}", diag::CSV_HEADER);
         let skip = rows.len().saturating_sub(1000);
         for row in &rows[skip..] {
             let _ = writeln!(r, "{}", row.to_csv());
         }
+        r
+    }
 
-        let path = self.dir.join("laporan-diagnostik.txt");
-        let _ = std::fs::create_dir_all(&self.dir);
-        match std::fs::write(&path, r) {
-            Ok(()) => {
-                win::reveal_file(&path);
-                win::open_in_notepad(&path);
-                if !self.settings.diagnostics {
+    /// Penjaga berkala: buka ulang setelah crash, halaman macet, catatan RAM, kesehatan start.
+    fn guard_tick(&mut self, target: &EventLoopWindowTarget<UserEvent>, now: Instant) {
+        if self.guard.hold_until.is_some_and(|t| now >= t) {
+            self.guard.hold_until = None;
+            self.log("mode aman: jeda muat ulang otomatis selesai");
+        }
+        let held = self.guard.hold_until.is_some();
+
+        if let Some((t, url)) = self.guard.reopen.clone() {
+            if now >= t {
+                self.guard.reopen = None;
+                if self.inst.is_none() && !held {
+                    self.log("membuka lagi Outlook di halaman terakhir setelah WebView2 berhenti");
+                    self.show(target, Some(&url));
+                }
+            } else {
+                self.next_tick = self.next_tick.min(t);
+            }
+        }
+
+        if let Some(h) = self.guard.hung_at {
+            let heard = self.guard.last_state_at.is_some_and(|t| t > h);
+            if heard || self.inst.is_none() {
+                self.guard.hung_at = None;
+            } else if now.duration_since(h) >= HUNG_RELOAD_AFTER {
+                if self.composing {
+                    self.log("halaman macet saat menulis email: tidak dimuat ulang otomatis");
+                    self.guard.hung_at = None;
+                } else if !held {
+                    self.log("halaman tersembunyi macet lebih dari 75 detik: dimuat ulang");
+                    self.diag_note("macet: muat ulang");
+                    if let Some(inst) = &self.inst {
+                        let _ = inst.webview.reload();
+                    }
+                    self.settle_until = Some(now + REFRESH_SETTLE);
+                    self.guard.hung_at = None;
+                }
+            } else {
+                self.next_tick = self.next_tick.min(h + HUNG_RELOAD_AFTER);
+            }
+        }
+
+        // Catatan RAM & CPU tiap 10 menit di log biasa (tanpa perlu menyalakan diagnostik).
+        let first_due = self.started.elapsed() >= Duration::from_secs(60);
+        if first_due
+            && self
+                .guard
+                .last_mem_log
+                .is_none_or(|t| now.duration_since(t) >= MEM_LOG_EVERY)
+        {
+            self.guard.last_mem_log = Some(now);
+            self.log_memory_line(now);
+        }
+
+        // Peringatan RAM besar saat jendela dipakai (cek tiap menit).
+        let looking = self
+            .inst
+            .as_ref()
+            .is_some_and(|i| i.visible && !i.minimized);
+        if looking
+            && self.settings.memory_warn_mb > 0
+            && self
+                .guard
+                .mem_check_at
+                .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60))
+        {
+            self.guard.mem_check_at = Some(now);
+            if let Some(m) = win::process_tree_memory() {
+                let mb = m.working / (1024 * 1024);
+                let warned_recent = self
+                    .guard
+                    .mem_warned_at
+                    .is_some_and(|t| now.duration_since(t) < MEM_WARN_EVERY);
+                if mb >= self.settings.memory_warn_mb as u64 && !warned_recent {
+                    self.guard.mem_warned_at = Some(now);
+                    self.log(&format!(
+                        "peringatan memori: {mb} MB (batas {} MB)",
+                        self.settings.memory_warn_mb
+                    ));
                     self.toast(
-                        "Laporan dibuat",
-                        "Catat diagnostik belum aktif: aktifkan dulu agar laporan berisi data RAM & CPU.",
+                        &format!("Outlook Lite memakai {mb} MB RAM"),
+                        "Biasanya karena pratinjau lampiran besar. Tutup pratinjaunya, atau buka lampiran di Excel/Word desktop.",
                         None,
                         Some(false),
                     );
                 }
             }
-            Err(e) => self.log(&format!("laporan gagal: {e}")),
         }
+
+        // Cek kesehatan sekali setelah start: jumlah belum dibaca harus sudah terbaca.
+        if !self.guard.health_done && self.started.elapsed() >= HEALTH_CHECK_AFTER {
+            self.guard.health_done = true;
+            let siaga = self.active_mode() == Mode::Siaga;
+            if siaga && self.unread.is_none() && !self.needs_login && !held && win::is_online() {
+                let url = self
+                    .inst
+                    .as_ref()
+                    .and_then(|i| i.webview.url().ok())
+                    .map(|u| urlutil::host_of(&u).unwrap_or_default())
+                    .unwrap_or_else(|| "-".into());
+                self.log(&format!(
+                    "cek kesehatan: jumlah belum dibaca belum terbaca 2 menit setelah start (halaman {url}, Outlook {})",
+                    if self.inst.is_some() { "ada" } else { "belum dibuat" }
+                ));
+                self.diag_note("cek kesehatan gagal");
+                self.toast(
+                    "Outlook belum siap",
+                    "Jumlah email belum dibaca belum terbaca. Klik untuk membuka Outlook dan memeriksanya.",
+                    None,
+                    Some(false),
+                );
+            }
+        }
+    }
+
+    /// Satu baris RAM & CPU ke outlook-lite.log (rata-rata CPU sejak catatan sebelumnya).
+    fn log_memory_line(&mut self, now: Instant) {
+        let kinds = self
+            .inst
+            .as_ref()
+            .map(|i| win::webview_process_kinds(&i.webview))
+            .unwrap_or_default();
+        let procs = win::process_snapshot(&kinds);
+        if procs.is_empty() {
+            return;
+        }
+        let state = self.diag_state_now();
+        let unread = self.shown_unread();
+        let sampler = self.guard.log_sampler.get_or_insert_with(|| {
+            diag::Sampler::new(
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1),
+            )
+        });
+        let first = sampler.is_fresh();
+        let row = sampler.row(now, String::new(), state, &procs, unread, "");
+        self.log(&format!(
+            "RAM {:.0} MB (commit {:.0}; halaman {:.0}, lain {:.0}, GPU {:.0}, inti {:.0}), {} proses, CPU {}, {}",
+            row.ram_mb,
+            row.commit_mb,
+            row.renderer_main_mb,
+            row.renderer_other_mb,
+            row.gpu_mb,
+            row.browser_mb,
+            row.procs,
+            if first { "-".to_string() } else { format!("{:.1}% rata-rata 10 mnt", row.cpu) },
+            state.label()
+        ));
     }
 
     /// Kembalikan prioritas normal (jendela dibuka): Outlook langsung responsif.
@@ -2001,7 +2696,9 @@ impl App {
             && !minimized
             && !self.focused
             && !self.low_unfocused
-            && self.unfocused_since.is_some_and(|t| t.elapsed() >= UNFOCUSED_LOW)
+            && self
+                .unfocused_since
+                .is_some_and(|t| t.elapsed() >= UNFOCUSED_LOW)
         {
             set_memory_low(&inst.webview, true);
             self.low_unfocused = true;
@@ -2060,7 +2757,9 @@ impl App {
 
         // Outlook web membengkak bila berjalan berjam-jam: segarkan saat tersembunyi.
         let hidden_long = !visible
-            && self.hidden_since.is_some_and(|t| t.elapsed() >= REFRESH_MIN_HIDDEN);
+            && self
+                .hidden_since
+                .is_some_and(|t| t.elapsed() >= REFRESH_MIN_HIDDEN);
         let check_due = self
             .last_refresh_check
             .is_none_or(|t| t.elapsed() >= REFRESH_CHECK_EVERY);
@@ -2099,7 +2798,7 @@ impl App {
             self.log(&why);
             self.diag_note(&why);
             if let Some(inst) = &self.inst {
-                let _ = inst.webview.load_url(MAIL_URL);
+                let _ = inst.webview.load_url(&site(MAIL_URL));
             }
             self.page_fresh_at = Some(now);
             self.settle_until = Some(now + REFRESH_SETTLE);
@@ -2140,7 +2839,8 @@ impl App {
     }
 
     fn sound_recent(&self) -> bool {
-        self.last_sound.is_some_and(|t| t.elapsed() < Duration::from_secs(10))
+        self.last_sound
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
     }
 
     /// Jadwalkan tick saat batch email masuk perlu ditutup.
@@ -2154,7 +2854,8 @@ impl App {
     fn note_count(&mut self, prev: Option<i64>, total: i64) {
         // Sesaat setelah Outlook disegarkan, angka bisa naik-turun saat halaman dimuat.
         let settling = self.settle_until.is_some_and(|t| Instant::now() < t);
-        self.mail.on_count(if settling { None } else { prev }, total, Instant::now());
+        self.mail
+            .on_count(if settling { None } else { prev }, total, Instant::now());
         self.schedule_mail_flush();
     }
 
@@ -2230,6 +2931,10 @@ impl App {
 
     fn on_state(&mut self, unread: i64, composing: bool, how: String, force: bool) {
         self.composing = composing;
+        self.guard.last_state_at = Some(Instant::now());
+        if self.guard.hung_at.take().is_some() {
+            self.log("halaman macet pulih sendiri");
+        }
         if let Some((t, from)) = self.restore_started.take() {
             // Waktu dari jendela dibuka sampai halaman Outlook menjawab lagi.
             let ms = t.elapsed().as_millis();
@@ -2265,7 +2970,7 @@ impl App {
                 .is_some_and(|i| i.webview.url().is_ok_and(|u| is_outlook_mail_url(&u)));
             if !on_mail {
                 if let Some(inst) = &self.inst {
-                    let _ = inst.webview.load_url(MAIL_URL);
+                    let _ = inst.webview.load_url(&site(MAIL_URL));
                 }
                 self.settle_until = Some(Instant::now() + REFRESH_SETTLE);
             }
@@ -2276,7 +2981,10 @@ impl App {
         } else if unread < 0 && force && self.manual_check {
             // Halaman menjawab, tapi panel folder tidak terbaca (mis. jendela terlalu sempit,
             // atau halaman Outlook belum selesai dimuat).
-            self.log(&format!("cek email: halaman menjawab tapi Inbox tidak terbaca ({})", self.unread_how));
+            self.log(&format!(
+                "cek email: halaman menjawab tapi Inbox tidak terbaca ({})",
+                self.unread_how
+            ));
             if !self.report_manual_last_known("panel folder tidak terbaca") {
                 self.manual_check = false;
                 self.toast(
@@ -2310,7 +3018,8 @@ impl App {
 
     fn on_notify(&mut self, id: u64, title: String, body: String) {
         let notice = mailalert::Notice { id, title, body };
-        self.mail.on_notice(notice, self.shown_unread(), Instant::now());
+        self.mail
+            .on_notice(notice, self.shown_unread(), Instant::now());
         self.schedule_mail_flush();
         self.force_read();
     }
@@ -2399,7 +3108,8 @@ impl App {
         if let Some(inst) = &self.inst {
             let _ = inst.webview.evaluate_script(INSPECT_JS);
             self.inspect_sent = true;
-            self.bg_deadline.get_or_insert(Instant::now() + INSPECT_TIMEOUT);
+            self.bg_deadline
+                .get_or_insert(Instant::now() + INSPECT_TIMEOUT);
         } else if self.create_instance(target, MAIL_URL, false) {
             self.bg_deadline = Some(Instant::now() + INSPECT_TIMEOUT);
         } else {
@@ -2438,10 +3148,13 @@ impl App {
                     None,
                     Some(false),
                 );
-                self.update_msg = Some(format!("Versi baru v{v} siap. Tekan \"Pakai sekarang\" di atas."));
+                self.update_msg = Some(format!(
+                    "Versi baru v{v} siap. Tekan \"Pakai sekarang\" di atas."
+                ));
                 self.update_ready = Some(v);
             }
             update::Outcome::UpToDate => {
+                self.guard.update_retries = 0;
                 if manual {
                     self.update_msg = Some(format!(
                         "Tidak ada update. v{VERSION} sudah terbaru (dicek {}).",
@@ -2457,6 +3170,16 @@ impl App {
             }
             update::Outcome::Failed(e) => {
                 self.log(&format!("cek update gagal: {e}"));
+                // Gagal (mis. internet/antivirus belum siap saat PC baru menyala): coba lagi
+                // 10 menit kemudian, maksimal 3 kali, bukan menunggu 24 jam.
+                if !manual && self.guard.update_retries < UPDATE_RETRY_MAX {
+                    self.guard.update_retries += 1;
+                    self.guard.update_retry_at = Some(Instant::now() + UPDATE_RETRY_AFTER);
+                    self.log(&format!(
+                        "cek update dicoba lagi 10 menit lagi (percobaan {}/{UPDATE_RETRY_MAX})",
+                        self.guard.update_retries
+                    ));
+                }
                 if manual {
                     self.update_msg = Some(format!("Cek update gagal: {e}"));
                     self.toast("Cek update gagal", &e, None, Some(false));
@@ -2524,12 +3247,19 @@ impl App {
             let can_retry = self
                 .create_failed_at
                 .is_none_or(|t| t.elapsed() >= CREATE_RETRY);
-            if self.inst.is_none() && can_retry && self.recreate_at.is_none() {
+            let held = self.guard.hold_until.is_some_and(|t| now < t);
+            if self.inst.is_none()
+                && can_retry
+                && self.recreate_at.is_none()
+                && self.guard.reopen.is_none()
+                && !held
+            {
                 self.create_instance(target, MAIL_URL, false);
             }
         }
 
         self.check_login_stuck();
+        self.guard_tick(target, now);
         if self.force_again.is_some_and(|t| now >= t) {
             self.force_again = None;
             if let Some(inst) = &self.inst {
@@ -2547,14 +3277,18 @@ impl App {
 
         // Batas waktu cek/diagnostik tersembunyi.
         if self.bg_deadline.is_some_and(|d| now >= d) {
-            if self.manual_check && !self.manual_reloaded && self.inst.is_some() && !self.inspect_pending {
+            if self.manual_check
+                && !self.manual_reloaded
+                && self.inst.is_some()
+                && !self.inspect_pending
+            {
                 // Halaman tidak menjawab (mis. tertidur lama di tray): muat ulang Outlook lalu
                 // tunggu lagi, sama seperti membuka ulang aplikasi.
                 self.manual_reloaded = true;
                 self.log("cek email: halaman tidak menjawab, memuat ulang Outlook");
                 self.diag_note("cek email: halaman tidak menjawab, muat ulang");
                 if let Some(inst) = &self.inst {
-                    let _ = inst.webview.load_url(MAIL_URL);
+                    let _ = inst.webview.load_url(&site(MAIL_URL));
                 }
                 self.settle_until = Some(now + REFRESH_SETTLE);
                 self.bg_deadline = Some(now + BG_CHECK_TIMEOUT);
@@ -2608,7 +3342,9 @@ impl App {
         if self.settings.auto_close && !self.composing {
             let limit = Duration::from_secs(self.settings.auto_close_min as u64 * 60);
             let visible = self.inst.as_ref().is_some_and(|i| i.visible);
-            if visible && !self.focused && self.unfocused_since.is_some_and(|t| t.elapsed() >= limit)
+            if visible
+                && !self.focused
+                && self.unfocused_since.is_some_and(|t| t.elapsed() >= limit)
             {
                 self.close_window();
             }
@@ -2621,8 +3357,9 @@ impl App {
             let due = match self.last_update_check {
                 None => self.started.elapsed() >= UPDATE_FIRST_DELAY,
                 Some(t) => t.elapsed() >= UPDATE_EVERY,
-            };
+            } || self.guard.update_retry_at.is_some_and(|t| now >= t);
             if due {
+                self.guard.update_retry_at = None;
                 self.start_update_check(false);
             }
         }
@@ -2661,7 +3398,11 @@ impl App {
                 // Contoh bentuk toast email masuk, dengan angka belum dibaca saat ini.
                 let total = self.shown_unread().map(|n| n.max(0) + 1);
                 let (title, l1, _) = mailalert::texts(
-                    &mailalert::Alert::Mail { new: Some(1), total, notice: None },
+                    &mailalert::Alert::Mail {
+                        new: Some(1),
+                        total,
+                        notice: None,
+                    },
                     false,
                 );
                 self.toast3(
@@ -2675,10 +3416,18 @@ impl App {
             id::AUTO_CLOSE => self.settings.auto_close = !self.settings.auto_close,
             id::LOW_MEM => self.settings.low_memory = !self.settings.low_memory,
             id::NO_GPU => {
-                self.settings.no_gpu = !self.settings.no_gpu;
+                // Saklar lama di tray: Mati <-> Ringan.
+                self.settings.gpu_mode = if self.settings.gpu_mode == "off" {
+                    "lite"
+                } else {
+                    "off"
+                }
+                .into();
                 self.save();
                 changed = false;
-                if win::confirm("Pengaturan GPU berlaku setelah restart. Restart Outlook Lite sekarang?") {
+                if win::confirm(
+                    "Pengaturan GPU berlaku setelah restart. Restart Outlook Lite sekarang?",
+                ) {
                     self.restart();
                 }
             }
@@ -2741,6 +3490,10 @@ impl App {
                 changed = false;
                 self.write_report();
             }
+            id::DIAG_COPY => {
+                changed = false;
+                self.copy_report();
+            }
             id::NO_SW => {
                 self.settings.block_service_worker = !self.settings.block_service_worker;
                 self.diag_note(if self.settings.block_service_worker {
@@ -2771,7 +3524,10 @@ impl App {
             id::UNINSTALL => {
                 changed = false;
                 // Proses terpisah menampilkan konfirmasi, lalu meminta instance ini keluar.
-                if let Err(e) = std::process::Command::new(&self.exe).arg("--uninstall").spawn() {
+                if let Err(e) = std::process::Command::new(&self.exe)
+                    .arg("--uninstall")
+                    .spawn()
+                {
                     self.log(&format!("uninstall gagal: {e}"));
                 }
             }
@@ -2845,7 +3601,11 @@ impl App {
                 window_id,
                 event: WindowEvent::CloseRequested,
                 ..
-            } if self.settings_win.as_ref().is_some_and(|w| w.window.id() == window_id) => {
+            } if self
+                .settings_win
+                .as_ref()
+                .is_some_and(|w| w.window.id() == window_id) =>
+            {
                 self.close_settings()
             }
             Event::WindowEvent {
@@ -2901,7 +3661,10 @@ impl App {
                 UserEvent::Remote(RemoteCmd::Exit) => {
                     self.quit("diminta instance lain (instal/update/hapus instalasi)")
                 }
-                UserEvent::ProcessFailed(kind) => self.on_process_failed(kind),
+                UserEvent::ProcessFailed(kind, reason, detail) => {
+                    self.on_process_failed(target, kind, reason, detail)
+                }
+                UserEvent::Download(uri, path, ok) => self.on_download(uri, path, ok),
                 UserEvent::NavDone(ok, status) => self.on_nav_done(ok, status),
                 UserEvent::SettingsUi(body) => self.on_settings_msg(target, &body),
                 UserEvent::Page(PageMsg::State {
@@ -2916,18 +3679,32 @@ impl App {
                 UserEvent::Page(PageMsg::Badge(n)) => self.on_badge(n),
                 UserEvent::Page(PageMsg::Sound) => self.on_sound(),
                 UserEvent::Page(PageMsg::Inspect(data)) => self.on_inspect(data),
+                UserEvent::Page(PageMsg::Attach { name, mb }) => {
+                    self.log(&format!(
+                        "lampiran diklik: unduh & buka di desktop ({})",
+                        mb.map_or("ukuran ?".into(), |m| format!("{m:.1} MB"))
+                    ));
+                    self.guard.attach_click = Some((name, mb, Instant::now()));
+                }
                 UserEvent::PageLoaded(url) => self.on_page_loaded(url),
                 UserEvent::ToastClick(id) => {
                     self.show(target, None);
                     if let (Some(id), Some(inst)) = (id, &self.inst) {
-                        let _ = inst
-                            .webview
-                            .evaluate_script(&format!("window.__oliteClick && window.__oliteClick({id})"));
+                        let _ = inst.webview.evaluate_script(&format!(
+                            "window.__oliteClick && window.__oliteClick({id})"
+                        ));
                     }
                 }
                 UserEvent::Update(out, manual) => self.on_update(out, manual),
             },
             Event::LoopDestroyed => {
+                if !self.exiting {
+                    // Windows dimatikan / dinyalakan ulang / keluar akun (WM_ENDSESSION): tao
+                    // mengakhiri loop lalu langsung keluar. Bukan crash: hapus penanda sesi.
+                    self.log("keluar: Windows dimatikan, dinyalakan ulang, atau keluar akun");
+                    let _ = std::fs::remove_file(self.dir.join(SESSION_MARKER));
+                    self.save();
+                }
                 if self.dirty {
                     self.save();
                 }
@@ -3007,7 +3784,10 @@ fn main() {
         Lock::Primary(l) => Some(l),
         Lock::Secondary => return,
         Lock::None => {
-            log(&dir, "port single-instance terpakai aplikasi lain; jalan tanpa penjaga");
+            log(
+                &dir,
+                "port single-instance terpakai aplikasi lain; jalan tanpa penjaga",
+            );
             None
         }
     };
@@ -3077,6 +3857,8 @@ fn main() {
 
     let browser_args = full_browser_args(&settings, args.tray);
     let settings_snapshot = settings.clone();
+    // Alamat Outlook dikunci per sesi (berubah setelah restart, seperti argumen WebView2).
+    UNIFY_DOMAIN.store(settings.unify_domain, std::sync::atomic::Ordering::Relaxed);
 
     let mut app = App {
         web_context: WebContext::new(Some(dir.join("WebView2"))),
@@ -3127,7 +3909,9 @@ fn main() {
         force_again: None,
         last_unread_note: String::new(),
         sampler: diag::Sampler::new(
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
         ),
         next_sample: None,
         diag_notes: Vec::new(),
@@ -3153,6 +3937,7 @@ fn main() {
         update_ready: None,
         initial_url,
         exiting: false,
+        guard: Guard::default(),
     };
     diag::set_domains_enabled(app.settings.diagnostics);
     if abnormal.is_some() {
@@ -3170,7 +3955,12 @@ mod tests {
     fn page_messages() {
         assert!(matches!(
             parse_page_msg(r#"{"t":"state","unread":3,"composing":true,"how":"angka"}"#),
-            Some(PageMsg::State { unread: 3, composing: true, force: false, .. })
+            Some(PageMsg::State {
+                unread: 3,
+                composing: true,
+                force: false,
+                ..
+            })
         ));
         match parse_page_msg(r#"{"t":"notify","id":7,"title":"A\u0007B","body":"x"}"#) {
             Some(PageMsg::Notify { id, title, .. }) => {
