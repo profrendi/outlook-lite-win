@@ -113,10 +113,14 @@ menambah RAM saat tidak dibuka.
   SHA-256. Versi baru aktif setelah restart.
 - **Single instance**: menjalankan exe lagi hanya menampilkan jendela yang ada.
 - Tautan di email dibuka di browser default Anda.
-- **Lampiran Office di aplikasi desktop** (Pengaturan > Lampiran): lampiran Excel/Word yang
-  diunduh langsung dibuka di Excel/Word (bawaan aktif; PowerPoint dan PDF bisa dinyalakan). Bisa
-  dibatasi ukuran minimal, mis. hanya file ≥ 1 MB (boleh desimal). Eksperimen *Klik lampiran = unduh
-  & buka di desktop* melewati pratinjau web yang berat untuk tabel besar.
+- **Lampiran Office di aplikasi desktop** (Pengaturan > Lampiran):
+  - *Klik lampiran langsung buka di aplikasi desktop*: klik lampiran Excel/Word tidak membuka
+    pratinjau web yang berat; file diunduh lalu dibuka di Excel/Word. Caranya lewat menu lampiran
+    (Unduh); bila menu itu tidak ada, pratinjau yang sempat terbuka langsung diunduh lalu ditutup.
+    Bila keduanya gagal, alasannya dicatat di log (baris `lampiran: ...`).
+  - *Lampiran yang diunduh juga dibuka otomatis*: saat Anda memilih Unduh/Download sendiri.
+  - Jenis file (Excel, Word, PowerPoint, PDF) dan ukuran minimal (boleh desimal, mis. 0.5 MB;
+    lebih kecil = pratinjau web biasa) berlaku untuk keduanya.
 - **Penjaga stabilitas**:
   - Halaman Outlook mati → dimuat ulang **di halaman yang sama**, dengan alasan (mis. kehabisan memori).
   - WebView2 berhenti total → jendela yang terbuka dibuka lagi otomatis.

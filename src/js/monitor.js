@@ -221,14 +221,21 @@
   }
   window.__oliteUnread = () => readUnread().n;
 
-  // Eksperimen: klik lampiran Office = unduh lalu dibuka di aplikasi desktop (bukan pratinjau
-  // web yang berat). Lewat menu "Unduh" milik Outlook sendiri; bila menu tidak ditemukan,
-  // klik diteruskan seperti biasa (pratinjau).
+  // Klik lampiran Office = unduh lalu dibuka di aplikasi desktop (bukan pratinjau web yang
+  // berat). Dua jalur:
+  //  1. kartu lampiran: buka menu lampiran ("Opsi lainnya") lalu klik "Unduh";
+  //  2. cadangan: bila pratinjau Office tetap terbuka, klik "Unduh" di pratinjau lalu tutup.
+  // Bila keduanya gagal, pratinjau biasa tetap berjalan dan alasannya dicatat di log.
   if (cfg.att && Array.isArray(cfg.att.types) && cfg.att.types.length) {
     const types = new Set(cfg.att.types.map((t) => String(t).toLowerCase()));
     const min = +cfg.att.min || 0;
     const nameRe = /([^\\/:*?"<>|\n,]{1,200}\.([a-z0-9]{2,5}))(?![a-z0-9])/i;
     const sizeRe = /(\d+(?:[.,]\d+)?)\s*(KB|MB|GB|bytes?|B)\b/i;
+    const DL = /^\s*(download|unduh)/i;
+    const CLOSE = /^\s*(close|tutup|back|kembali)\b/i;
+    const MORE = /(more|lainnya|opsi|options|actions|tindakan)/i;
+    const PREVIEW_IFRAME = 'iframe[src*="officeapps.live.com"], iframe[src*="officeapps-df.live.com"]';
+    const menuBtnSel = 'button[aria-haspopup], [role="button"][aria-haspopup]';
     const toMb = (txt) => {
       const m = sizeRe.exec(txt || '');
       if (!m) return null;
@@ -236,49 +243,130 @@
       const u = m[2].toUpperCase();
       return u === 'GB' ? v * 1024 : u === 'MB' ? v : u === 'KB' ? v / 1024 : v / 1048576;
     };
-    const menuBtnSel = 'button[aria-haspopup], [role="button"][aria-haspopup]';
-    const labelOf = (el) => (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '') + ' ' + (el.textContent || '').slice(0, 300);
-    // Cari kartu lampiran: leluhur terdekat (maks. 6 tingkat) yang menyebut nama file berjenis
-    // terpilih dan punya tombol menu ("Opsi lainnya").
-    const cardOf = (el) => {
-      for (let n = el, d = 0; n && n !== document.body && d < 7; n = n.parentElement, d++) {
+    const attr = (el, k) => (el.getAttribute && el.getAttribute(k)) || '';
+    const labelOf = (el) => attr(el, 'aria-label') + ' ' + attr(el, 'title') + ' ' + (el.textContent || '').slice(0, 300);
+    const btnText = (b) => (attr(b, 'aria-label') || attr(b, 'title') || b.textContent || '').trim();
+    const alog = (msg) => post({ t: 'attachlog', msg: String(msg).slice(0, 300) });
+    // Label tombol untuk diagnostik: huruf saja, tanpa nama file.
+    const safeLabels = (els) => els.map(btnText).filter(Boolean)
+      .map((x) => x.replace(nameRe, '<file>').slice(0, 30)).slice(0, 12).join(' | ');
+    const extFromIframe = (src) =>
+      /\/\/excel\./i.test(src) ? 'xlsx' : /\/\/word-(view|edit)\./i.test(src) ? 'docx'
+        : /\/\/powerpoint\./i.test(src) ? 'pptx' : '';
+    const sizeOk = (mb) => !(min > 0 && (mb === null || mb < min));
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    const isRow = (el) => el.closest('[data-convid],[data-focusable-row],[contenteditable="true"],[role="textbox"]');
+    // Elemen lampiran: leluhur terdekat (maks. 7 tingkat) yang menyebut nama file berjenis terpilih.
+    const fileOf = (el) => {
+      for (let n = el, d = 0; n && n !== document.body && d < 8; n = n.parentElement, d++) {
         const m = nameRe.exec(labelOf(n));
-        if (m && types.has(m[2].toLowerCase()) && n.querySelector(menuBtnSel)) {
-          return { card: n, name: m[1].trim(), ext: m[2].toLowerCase() };
+        if (m && types.has(m[2].toLowerCase())) {
+          let card = n;
+          // Naik sedikit lagi mencari wadah yang punya tombol menu (kartu lampiran).
+          for (let c = n, k = 0; c && c !== document.body && k < 4; c = c.parentElement, k++) {
+            if (c.querySelector(menuBtnSel)) { card = c; break; }
+          }
+          return { card, name: m[1].trim(), ext: m[2].toLowerCase(), mb: toMb(labelOf(card)) };
         }
       }
       return null;
     };
-    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    const findMenuItem = async (re) => {
+      for (let i = 0; i < 20; i++) {
+        await wait(75);
+        const it = [...document.querySelectorAll('[role="menuitem"],[role="menuitemcheckbox"]')]
+          .find((m) => re.test(btnText(m)));
+        if (it) return it;
+      }
+      return null;
+    };
+    const escape = () => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
+    const previewIframes = () => [...document.querySelectorAll(PREVIEW_IFRAME)];
+
+    // Jalur 2: pratinjau Office terbuka → klik Unduh di pratinjau, lalu tutup pratinjau.
+    let watching = 0;
+    const handled = new WeakSet(); // pratinjau yang sudah diproses (tidak diklik dua kali)
+    const watchPreview = (info, before) => {
+      const my = ++watching;
+      (async () => {
+        for (let i = 0; i < 40 && my === watching; i++) {
+          await wait(250);
+          const ifr = previewIframes().find((f) => !before.includes(f) && !handled.has(f));
+          const dialog = document.querySelector('[role="dialog"][aria-modal="true"], [role="dialog"]');
+          if (!ifr && !(info && dialog && !handled.has(dialog) && dialog.querySelector('iframe, embed, object'))) continue;
+          const ext = (info && info.ext) || extFromIframe((ifr && ifr.src) || '');
+          if (!ext || !types.has(ext)) return;
+          const mb = info ? info.mb : null;
+          if (!sizeOk(mb)) return;
+          const root = (ifr && (ifr.closest('[role="dialog"]') || ifr.closest('[aria-modal="true"]'))) || dialog || document;
+          if (ifr) handled.add(ifr);
+          if (root !== document) handled.add(root);
+          // Tunggu tombol pratinjau muncul (maks. ~3 detik).
+          let btn = null;
+          for (let k = 0; k < 12 && !btn; k++) {
+            btn = [...root.querySelectorAll('button,[role="button"],a[role="menuitem"],[role="menuitem"]')]
+              .find((b) => DL.test(btnText(b)) && !(ifr && ifr.contains(b)));
+            if (!btn) await wait(250);
+          }
+          if (!btn) {
+            // Mungkin di menu "lainnya" pada pratinjau.
+            const more = [...root.querySelectorAll(menuBtnSel)].find((b) => MORE.test(btnText(b)));
+            if (more) { more.click(); btn = await findMenuItem(DL); }
+          }
+          if (!btn) {
+            alog('pratinjau terbuka tapi tombol Unduh tidak ditemukan; tombol: '
+              + safeLabels([...root.querySelectorAll('button,[role="button"]')]));
+            return;
+          }
+          post({ t: 'attach', name: (info && info.name) || '', mb, via: 'pratinjau' });
+          btn.click();
+          await wait(400);
+          // Tutup pratinjau supaya Excel/Word Online tidak terus memakan memori.
+          const close = [...root.querySelectorAll('button,[role="button"]')].find((b) => CLOSE.test(btnText(b)));
+          if (close) close.click(); else escape();
+          return;
+        }
+      })();
+    };
+
     let bypass = false;
+    let warnedNoMenu = false;
     window.addEventListener('click', (ev) => {
       if (bypass || ev.button !== 0 || !ev.isTrusted) return;
       const t = ev.target instanceof Element ? ev.target : null;
-      if (!t || t.closest(menuBtnSel) || t.closest('[role="menu"],[role="menuitem"],a[href]')) return;
-      if (t.closest('[contenteditable="true"]')) return;
-      const hit = cardOf(t);
-      if (!hit) return;
-      const mb = toMb(labelOf(hit.card));
-      if (min > 0 && (mb === null || mb < min)) return; // kecil / tak diketahui: pratinjau biasa
+      if (!t || t.closest('[role="menu"],[role="menuitem"]') || isRow(t)) return;
+      const before = previewIframes();
+      const hit = t.closest(menuBtnSel) ? null : fileOf(t);
+      if (!hit) {
+        // Bukan lampiran yang dikenali: tetap awasi bila pratinjau Office terbuka.
+        if (min === 0) watchPreview(null, before);
+        return;
+      }
+      if (!sizeOk(hit.mb)) return; // kecil / ukuran tak diketahui: pratinjau biasa
+      const btn = hit.card.querySelector(menuBtnSel);
+      if (!btn) {
+        if (!warnedNoMenu) { warnedNoMenu = true; alog('kartu lampiran tanpa tombol menu; pakai jalur pratinjau'); }
+        watchPreview(hit, before);
+        return;
+      }
+      // Jalur 1: lewat menu lampiran.
       ev.preventDefault();
       ev.stopImmediatePropagation();
       (async () => {
-        const btn = hit.card.querySelector(menuBtnSel);
         btn.click();
-        let item = null;
-        for (let i = 0; i < 20 && !item; i++) {
-          await wait(75);
-          item = [...document.querySelectorAll('[role="menuitem"]')].find((m) =>
-            /^\s*(download|unduh)/i.test(m.textContent || m.getAttribute('aria-label') || ''));
-        }
+        const item = await findMenuItem(DL);
         if (item) {
-          post({ t: 'attach', name: hit.name, mb });
+          post({ t: 'attach', name: hit.name, mb: hit.mb, via: 'kartu' });
           item.click();
-        } else {
-          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-          bypass = true;
-          try { t.click(); } finally { bypass = false; }
+          return;
         }
+        alog('menu lampiran tanpa Unduh; item: '
+          + safeLabels([...document.querySelectorAll('[role="menuitem"]')]));
+        escape();
+        await wait(100);
+        bypass = true;
+        try { t.click(); } finally { bypass = false; }
+        watchPreview(hit, before);
       })();
     }, true);
   }

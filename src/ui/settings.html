@@ -210,9 +210,11 @@
 <details>
   <summary>Lampiran</summary>
   <div class="rows">
-    <div class="row"><div class="label">Buka lampiran Office di aplikasi desktop<span class="hint">Lampiran yang diunduh langsung dibuka di Excel/Word, bukan pratinjau web yang berat.</span></div>
+    <div class="row"><div class="label">Klik lampiran langsung buka di aplikasi desktop<span class="hint">Tanpa pratinjau web yang berat: lampiran diunduh lalu dibuka di Excel/Word.</span></div>
+      <label class="switch"><input type="checkbox" data-key="attach_intercept_preview"><span></span></label></div>
+    <div class="row"><div class="label">Lampiran yang diunduh juga dibuka otomatis<span class="hint">Saat Anda memilih Unduh/Download sendiri di Outlook.</span></div>
       <label class="switch"><input type="checkbox" data-key="attach_desktop"><span></span></label></div>
-    <div class="row"><div class="label">Hanya bila ukuran minimal (MB)<span class="hint">0 = semua ukuran. Boleh desimal, mis. 0.5.</span></div><input type="number" min="0" max="2000" step="0.1" data-key="attach_min_mb" data-decimal="1"></div>
+    <div class="row"><div class="label">Hanya bila ukuran minimal (MB)<span class="hint">0 = semua ukuran. Boleh desimal, mis. 0.5. Lebih kecil = pratinjau web biasa.</span></div><input type="number" min="0" max="2000" step="0.1" data-key="attach_min_mb" data-decimal="1"></div>
     <div class="row" style="display:block"><div class="label" style="margin-bottom:6px">Jenis file</div>
       <div class="days">
         <label><input type="checkbox" data-key="attach_excel"><b>Excel</b></label>
@@ -220,8 +222,6 @@
         <label><input type="checkbox" data-key="attach_ppt"><b>PowerPoint</b></label>
         <label><input type="checkbox" data-key="attach_pdf"><b>PDF</b></label>
       </div></div>
-    <div class="row"><div class="label">Klik lampiran = unduh &amp; buka di desktop<span class="tag">eksperimen</span><span class="hint">Lewati pratinjau web untuk jenis di atas. Ukuran dibaca dari tampilan Outlook bila ada.</span></div>
-      <label class="switch"><input type="checkbox" data-key="attach_intercept_preview"><span></span></label></div>
   </div>
 </details>
 

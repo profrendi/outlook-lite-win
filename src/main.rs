@@ -309,7 +309,11 @@ enum PageMsg {
     Attach {
         name: String,
         mb: Option<f64>,
+        /// Jalur yang berhasil: "kartu" (menu lampiran) atau "pratinjau" (tombol unduh pratinjau).
+        via: String,
     },
+    /// Catatan diagnostik fitur lampiran (hanya label UI, tanpa nama file).
+    AttachLog(String),
 }
 
 fn clean(s: &str, max: usize) -> String {
@@ -349,7 +353,9 @@ fn parse_page_msg(body: &str) -> Option<PageMsg> {
                 .get("mb")
                 .and_then(|x| x.as_f64())
                 .filter(|x| x.is_finite() && *x >= 0.0),
+            via: s("via", 16),
         }),
+        "attachlog" => Some(PageMsg::AttachLog(s("msg", 300))),
         "inspect" => Some(PageMsg::Inspect(
             v.get("data")?.as_str()?.chars().take(300_000).collect(),
         )),
@@ -1275,7 +1281,7 @@ impl App {
             "sel": st.unread_selector,
             "nosw": st.block_service_worker,
             // Eksperimen: klik lampiran = unduh lalu buka di aplikasi desktop.
-            "att": (st.attach_desktop && st.attach_intercept_preview).then(|| serde_json::json!({
+            "att": st.attach_intercept_preview.then(|| serde_json::json!({
                 "types": att_types,
                 "min": st.attach_min_mb,
             })),
@@ -1937,12 +1943,12 @@ impl App {
             .attach_click
             .take()
             .filter(|(_, _, t)| t.elapsed() < Duration::from_secs(120));
-        let open = attach_should_open(&self.settings, &ext, mb)
-            || clicked.is_some_and(|(n, _, _)| {
-                // Unduhan dari klik lampiran (eksperimen): dibuka bila jenisnya cocok.
-                path.file_name().is_some_and(|f| f.to_string_lossy() == n)
-                    && attach_type_on(&self.settings, &ext)
-            });
+        // Unduhan dari "klik lampiran = buka di desktop": selalu dibuka bila jenisnya dipilih,
+        // walau "Buka lampiran yang diunduh" mati. (Nama file bisa berbeda, mis. "Data (1).xlsx".)
+        let from_click = self.settings.attach_intercept_preview
+            && clicked.is_some()
+            && attach_type_on(&self.settings, &ext);
+        let open = attach_should_open(&self.settings, &ext, mb) || from_click;
         self.log(&format!(
             "unduhan selesai: .{ext} {mb:.1} MB{}",
             if open {
@@ -2265,8 +2271,7 @@ impl App {
             "block_telemetry" | "block_extra" | "unread_selector" => self.recreate_instance(target),
             // Skrip klik lampiran (eksperimen) dipasang saat Outlook dibuat.
             "attach_intercept_preview" => self.recreate_instance(target),
-            "attach_desktop" | "attach_excel" | "attach_word" | "attach_ppt" | "attach_pdf"
-            | "attach_min_mb"
+            "attach_excel" | "attach_word" | "attach_ppt" | "attach_pdf" | "attach_min_mb"
                 if self.settings.attach_intercept_preview =>
             {
                 self.recreate_instance(target)
@@ -3679,12 +3684,15 @@ impl App {
                 UserEvent::Page(PageMsg::Badge(n)) => self.on_badge(n),
                 UserEvent::Page(PageMsg::Sound) => self.on_sound(),
                 UserEvent::Page(PageMsg::Inspect(data)) => self.on_inspect(data),
-                UserEvent::Page(PageMsg::Attach { name, mb }) => {
+                UserEvent::Page(PageMsg::Attach { name, mb, via }) => {
                     self.log(&format!(
-                        "lampiran diklik: unduh & buka di desktop ({})",
+                        "lampiran diklik: diunduh lewat {via} untuk dibuka di desktop ({})",
                         mb.map_or("ukuran ?".into(), |m| format!("{m:.1} MB"))
                     ));
                     self.guard.attach_click = Some((name, mb, Instant::now()));
+                }
+                UserEvent::Page(PageMsg::AttachLog(msg)) => {
+                    self.log(&format!("lampiran: {msg}"));
                 }
                 UserEvent::PageLoaded(url) => self.on_page_loaded(url),
                 UserEvent::ToastClick(id) => {
