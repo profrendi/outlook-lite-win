@@ -221,21 +221,37 @@
   }
   window.__oliteUnread = () => readUnread().n;
 
-  // Klik lampiran Office = unduh lalu dibuka di aplikasi desktop (bukan pratinjau web yang
-  // berat). Dua jalur:
-  //  1. kartu lampiran: buka menu lampiran ("Opsi lainnya") lalu klik "Unduh";
-  //  2. cadangan: bila pratinjau Office tetap terbuka, klik "Unduh" di pratinjau lalu tutup.
-  // Bila keduanya gagal, pratinjau biasa tetap berjalan dan alasannya dicatat di log.
-  if (cfg.att && Array.isArray(cfg.att.types) && cfg.att.types.length) {
+  // Lampiran Office/PDF dibuka di aplikasi desktop (bukan pratinjau web yang berat).
+  //  A. "Open/Edit in ... desktop app" (menu lampiran atau tombol di pratinjau) selalu diubah
+  //     menjadi: unduh lalu buka di desktop. (Bawaan Outlook justru membuka Office web di sini.)
+  //  B. Bila "Klik lampiran langsung buka di desktop" menyala, klik lampiran biasa juga:
+  //     1. lewat menu lampiran → "Download";
+  //     2. cadangan: bila pratinjau tetap terbuka, klik "Download" di pratinjau lalu tutup.
+  // Bila gagal, perilaku bawaan Outlook tetap berjalan dan alasannya dicatat di log.
+  if (cfg.att && Array.isArray(cfg.att.types)) {
     const types = new Set(cfg.att.types.map((t) => String(t).toLowerCase()));
+    const intercept = !!cfg.att.intercept && types.size > 0;
     const min = +cfg.att.min || 0;
     const nameRe = /([^\\/:*?"<>|\n,]{1,200}\.([a-z0-9]{2,5}))(?![a-z0-9])/i;
+    const nameReG = /[^\\/:*?"<>|\n,\s]{1,200}\.(xlsx|xlsm|xlsb|xls|csv|docx|docm|doc|rtf|pptx|pptm|ppsx|ppt|pdf)(?![a-z0-9])/gi;
     const sizeRe = /(\d+(?:[.,]\d+)?)\s*(KB|MB|GB|bytes?|B)\b/i;
-    const DL = /^\s*(download|unduh)/i;
-    const CLOSE = /^\s*(close|tutup|back|kembali)\b/i;
-    const MORE = /(more|lainnya|opsi|options|actions|tindakan)/i;
+    const DL = /^(download|unduh)\b/i;
+    const CLOSE = /^(close|tutup|back|kembali)\b/i;
+    const DESKTOP = /(desktop app|desktop application|aplikasi desktop)/i;
+    const OPEN_IN_APP = /^open in (excel|word|powerpoint|visio)$/i;
+    const WEB = /(web|browser|peramban|online)/i;
+    const NOT_CARD_BTN = /(reply|forward|balas|teruskan|viva|apps|aplikasi$)/i;
     const PREVIEW_IFRAME = 'iframe[src*="officeapps.live.com"], iframe[src*="officeapps-df.live.com"]';
     const menuBtnSel = 'button[aria-haspopup], [role="button"][aria-haspopup]';
+    const clickableSel = 'button,[role="button"],[role="menuitem"],a[role="menuitem"]';
+    // Teks tombol tanpa ikon font (karakter Private Use Area) dan spasi tak terlihat: ikon
+    // Fluent ditulis sebagai karakter di awal teks, mis. "Download".
+    const norm = (t) => String(t || '').replace(/[-​-‏⁠﻿]/g, '').replace(/\s+/g, ' ').trim();
+    const attr = (el, k) => (el.getAttribute && el.getAttribute(k)) || '';
+    const btnText = (b) => norm(attr(b, 'aria-label')) || norm(attr(b, 'title')) || norm(b.textContent);
+    const btnTexts = (b) => [norm(attr(b, 'aria-label')), norm(attr(b, 'title')), norm(b.textContent)].filter(Boolean);
+    const isDl = (b) => btnTexts(b).some((t) => DL.test(t));
+    const labelOf = (el) => norm(attr(el, 'aria-label') + ' ' + attr(el, 'title') + ' ' + (el.textContent || '').slice(0, 400));
     const toMb = (txt) => {
       const m = sizeRe.exec(txt || '');
       if (!m) return null;
@@ -243,130 +259,159 @@
       const u = m[2].toUpperCase();
       return u === 'GB' ? v * 1024 : u === 'MB' ? v : u === 'KB' ? v / 1024 : v / 1048576;
     };
-    const attr = (el, k) => (el.getAttribute && el.getAttribute(k)) || '';
-    const labelOf = (el) => attr(el, 'aria-label') + ' ' + attr(el, 'title') + ' ' + (el.textContent || '').slice(0, 300);
-    const btnText = (b) => (attr(b, 'aria-label') || attr(b, 'title') || b.textContent || '').trim();
     const alog = (msg) => post({ t: 'attachlog', msg: String(msg).slice(0, 300) });
-    // Label tombol untuk diagnostik: huruf saja, tanpa nama file.
+    // Label tombol untuk diagnostik, tanpa nama file.
     const safeLabels = (els) => els.map(btnText).filter(Boolean)
-      .map((x) => x.replace(nameRe, '<file>').slice(0, 30)).slice(0, 12).join(' | ');
+      .map((x) => x.replace(nameReG, '<file>').slice(0, 30)).slice(0, 14).join(' | ');
     const extFromIframe = (src) =>
       /\/\/excel\./i.test(src) ? 'xlsx' : /\/\/word-(view|edit)\./i.test(src) ? 'docx'
         : /\/\/powerpoint\./i.test(src) ? 'pptx' : '';
     const sizeOk = (mb) => !(min > 0 && (mb === null || mb < min));
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    const visible = (el) => !!(el.offsetParent || el.getClientRects().length);
     const isRow = (el) => el.closest('[data-convid],[data-focusable-row],[contenteditable="true"],[role="textbox"]');
-    // Elemen lampiran: leluhur terdekat (maks. 7 tingkat) yang menyebut nama file berjenis terpilih.
+    const inMenu = (el) => el.closest('[role="menu"],[role="listbox"][aria-label*="menu" i]');
+    const previewIframes = () => [...document.querySelectorAll(PREVIEW_IFRAME)];
+    const dlButtons = () => [...document.querySelectorAll(clickableSel)]
+      .filter((b) => !inMenu(b) && isDl(b) && visible(b));
+    const escape = () => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
+
+    // Kartu lampiran: wadah kecil berisi tepat satu nama file + tombol menu (panah ˅).
     const fileOf = (el) => {
       for (let n = el, d = 0; n && n !== document.body && d < 8; n = n.parentElement, d++) {
         const m = nameRe.exec(labelOf(n));
-        if (m && types.has(m[2].toLowerCase())) {
-          let card = n;
-          // Naik sedikit lagi mencari wadah yang punya tombol menu (kartu lampiran).
-          for (let c = n, k = 0; c && c !== document.body && k < 4; c = c.parentElement, k++) {
-            if (c.querySelector(menuBtnSel)) { card = c; break; }
-          }
-          return { card, name: m[1].trim(), ext: m[2].toLowerCase(), mb: toMb(labelOf(card)) };
+        if (!m || !types.has(m[2].toLowerCase())) continue;
+        let card = null, btn = null;
+        for (let c = n, k = 0; c && c !== document.body && k < 5; c = c.parentElement, k++) {
+          const txt = norm(c.textContent);
+          if (txt.length > 400 || (txt.match(nameReG) || []).length > 1) break; // terlalu besar
+          btn = [...c.querySelectorAll(menuBtnSel)].find((b) => !NOT_CARD_BTN.test(btnText(b)));
+          if (btn) { card = c; break; }
+        }
+        return { card: card || n, btn, name: m[1].trim(), ext: m[2].toLowerCase(), mb: toMb(labelOf(card || n)) };
+      }
+      return null;
+    };
+    // Tunggu menu yang baru muncul, lalu cari item di dalamnya.
+    const findInNewMenu = async (before, test) => {
+      for (let i = 0; i < 25; i++) {
+        await wait(80);
+        const menus = [...document.querySelectorAll('[role="menu"]')].filter((m) => !before.includes(m));
+        for (const m of menus.reverse()) {
+          const it = [...m.querySelectorAll('[role="menuitem"],[role="menuitemcheckbox"],button')].find(test);
+          if (it) return { item: it, menu: m };
         }
       }
       return null;
     };
-    const findMenuItem = async (re) => {
-      for (let i = 0; i < 20; i++) {
-        await wait(75);
-        const it = [...document.querySelectorAll('[role="menuitem"],[role="menuitemcheckbox"]')]
-          .find((m) => re.test(btnText(m)));
-        if (it) return it;
+    const closeNear = (el) => {
+      for (let n = el, d = 0; n && n !== document.body && d < 10; n = n.parentElement, d++) {
+        const c = [...n.querySelectorAll('button,[role="button"]')].find((b) => btnTexts(b).some((t) => CLOSE.test(t)));
+        if (c) { c.click(); return; }
       }
-      return null;
+      escape();
     };
-    const escape = () => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
-    const previewIframes = () => [...document.querySelectorAll(PREVIEW_IFRAME)];
 
-    // Jalur 2: pratinjau Office terbuka → klik Unduh di pratinjau, lalu tutup pratinjau.
+    // Pratinjau terbuka → klik "Download" di pratinjau, lalu tutup pratinjau.
     let watching = 0;
-    const handled = new WeakSet(); // pratinjau yang sudah diproses (tidak diklik dua kali)
-    const watchPreview = (info, before) => {
+    const handled = new WeakSet();
+    const watchPreview = (info, beforeIfr, beforeDl, via) => {
       const my = ++watching;
       (async () => {
-        for (let i = 0; i < 40 && my === watching; i++) {
+        for (let i = 0; i < 48 && my === watching; i++) {
           await wait(250);
-          const ifr = previewIframes().find((f) => !before.includes(f) && !handled.has(f));
-          const dialog = document.querySelector('[role="dialog"][aria-modal="true"], [role="dialog"]');
-          if (!ifr && !(info && dialog && !handled.has(dialog) && dialog.querySelector('iframe, embed, object'))) continue;
+          const ifr = previewIframes().find((f) => !beforeIfr.includes(f) && !handled.has(f));
+          // Tombol Download baru (mis. bilah pratinjau Excel/Word/PDF) setelah lampiran diklik.
+          const newDl = info ? dlButtons().find((b) => !beforeDl.includes(b) && !handled.has(b)) : null;
+          if (!ifr && !newDl) continue;
           const ext = (info && info.ext) || extFromIframe((ifr && ifr.src) || '');
-          if (!ext || !types.has(ext)) return;
+          if (via !== 'desktop' && (!ext || !types.has(ext))) return;
           const mb = info ? info.mb : null;
-          if (!sizeOk(mb)) return;
-          const root = (ifr && (ifr.closest('[role="dialog"]') || ifr.closest('[aria-modal="true"]'))) || dialog || document;
-          if (ifr) handled.add(ifr);
-          if (root !== document) handled.add(root);
-          // Tunggu tombol pratinjau muncul (maks. ~3 detik).
-          let btn = null;
+          if (via !== 'desktop' && !sizeOk(mb)) return;
+          let btn = newDl;
           for (let k = 0; k < 12 && !btn; k++) {
-            btn = [...root.querySelectorAll('button,[role="button"],a[role="menuitem"],[role="menuitem"]')]
-              .find((b) => DL.test(btnText(b)) && !(ifr && ifr.contains(b)));
+            btn = dlButtons().find((b) => !beforeDl.includes(b) && !handled.has(b) && !(ifr && ifr.contains(b)));
             if (!btn) await wait(250);
           }
+          if (ifr) handled.add(ifr);
           if (!btn) {
-            // Mungkin di menu "lainnya" pada pratinjau.
-            const more = [...root.querySelectorAll(menuBtnSel)].find((b) => MORE.test(btnText(b)));
-            if (more) { more.click(); btn = await findMenuItem(DL); }
-          }
-          if (!btn) {
-            alog('pratinjau terbuka tapi tombol Unduh tidak ditemukan; tombol: '
-              + safeLabels([...root.querySelectorAll('button,[role="button"]')]));
+            alog('pratinjau terbuka tapi tombol Download tidak ditemukan; tombol: '
+              + safeLabels([...document.querySelectorAll('button,[role="button"]')].filter(visible).slice(-20)));
             return;
           }
-          post({ t: 'attach', name: (info && info.name) || '', mb, via: 'pratinjau' });
+          handled.add(btn);
+          post({ t: 'attach', name: (info && info.name) || '', mb, via: via || 'pratinjau' });
           btn.click();
-          await wait(400);
-          // Tutup pratinjau supaya Excel/Word Online tidak terus memakan memori.
-          const close = [...root.querySelectorAll('button,[role="button"]')].find((b) => CLOSE.test(btnText(b)));
-          if (close) close.click(); else escape();
+          await wait(500);
+          closeNear(btn); // tutup pratinjau supaya Excel/Word web tidak terus memakan memori
           return;
         }
       })();
     };
 
     let bypass = false;
-    let warnedNoMenu = false;
+    const replay = (t) => { bypass = true; try { t.click(); } finally { bypass = false; } };
+
     window.addEventListener('click', (ev) => {
       if (bypass || ev.button !== 0 || !ev.isTrusted) return;
       const t = ev.target instanceof Element ? ev.target : null;
-      if (!t || t.closest('[role="menu"],[role="menuitem"]') || isRow(t)) return;
-      const before = previewIframes();
+      if (!t || isRow(t)) return;
+
+      // A. "Edit in Excel desktop app" / "Open in Excel Desktop app" / tombol "Open in Excel".
+      const opt = t.closest(clickableSel);
+      if (opt) {
+        const txts = btnTexts(opt);
+        const wantsDesktop = txts.some((x) => (DESKTOP.test(x) || OPEN_IN_APP.test(x)) && !WEB.test(x));
+        if (wantsDesktop) {
+          const menu = opt.closest('[role="menu"]');
+          const sib = menu && [...menu.querySelectorAll('[role="menuitem"],button')].find(isDl);
+          const dl = sib || dlButtons().find((b) => b !== opt);
+          if (dl) {
+            ev.preventDefault();
+            ev.stopImmediatePropagation();
+            post({ t: 'attach', name: '', mb: null, via: 'desktop' });
+            dl.click();
+            if (!sib) setTimeout(() => closeNear(dl), 500);
+            else escape();
+            return;
+          }
+          alog('"' + txts[0].replace(nameReG, '<file>').slice(0, 40) + '" tanpa tombol Download di dekatnya; dibiarkan ke Outlook');
+          return;
+        }
+      }
+      if (!intercept || inMenu(t)) return;
+
+      // B. Klik lampiran biasa.
+      const beforeIfr = previewIframes();
+      const beforeDl = dlButtons();
       const hit = t.closest(menuBtnSel) ? null : fileOf(t);
       if (!hit) {
-        // Bukan lampiran yang dikenali: tetap awasi bila pratinjau Office terbuka.
-        if (min === 0) watchPreview(null, before);
+        if (min === 0) watchPreview(null, beforeIfr, beforeDl); // pratinjau Office tanpa kartu dikenali
         return;
       }
       if (!sizeOk(hit.mb)) return; // kecil / ukuran tak diketahui: pratinjau biasa
-      const btn = hit.card.querySelector(menuBtnSel);
-      if (!btn) {
-        if (!warnedNoMenu) { warnedNoMenu = true; alog('kartu lampiran tanpa tombol menu; pakai jalur pratinjau'); }
-        watchPreview(hit, before);
+      if (!hit.btn) {
+        watchPreview(hit, beforeIfr, beforeDl);
         return;
       }
-      // Jalur 1: lewat menu lampiran.
       ev.preventDefault();
       ev.stopImmediatePropagation();
       (async () => {
-        btn.click();
-        const item = await findMenuItem(DL);
-        if (item) {
-          post({ t: 'attach', name: hit.name, mb: hit.mb, via: 'kartu' });
-          item.click();
+        const beforeMenus = [...document.querySelectorAll('[role="menu"]')];
+        hit.btn.click();
+        const found = await findInNewMenu(beforeMenus, isDl);
+        if (found) {
+          post({ t: 'attach', name: hit.name, mb: hit.mb, via: 'menu lampiran' });
+          found.item.click();
           return;
         }
-        alog('menu lampiran tanpa Unduh; item: '
-          + safeLabels([...document.querySelectorAll('[role="menuitem"]')]));
+        const menus = [...document.querySelectorAll('[role="menu"]')].filter((m) => !beforeMenus.includes(m));
+        alog('menu lampiran tanpa Download; item: '
+          + safeLabels(menus.flatMap((m) => [...m.querySelectorAll('[role="menuitem"]')])));
         escape();
-        await wait(100);
-        bypass = true;
-        try { t.click(); } finally { bypass = false; }
-        watchPreview(hit, before);
+        await wait(120);
+        replay(t);
+        watchPreview(hit, beforeIfr, beforeDl);
       })();
     }, true);
   }

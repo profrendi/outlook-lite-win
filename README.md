@@ -118,9 +118,12 @@ menambah RAM saat tidak dibuka.
     pratinjau web yang berat; file diunduh lalu dibuka di Excel/Word. Caranya lewat menu lampiran
     (Unduh); bila menu itu tidak ada, pratinjau yang sempat terbuka langsung diunduh lalu ditutup.
     Bila keduanya gagal, alasannya dicatat di log (baris `lampiran: ...`).
-  - *Lampiran yang diunduh juga dibuka otomatis*: saat Anda memilih Unduh/Download sendiri.
-  - Jenis file (Excel, Word, PowerPoint, PDF) dan ukuran minimal (boleh desimal, mis. 0.5 MB;
-    lebih kecil = pratinjau web biasa) berlaku untuk keduanya.
+  - *Lampiran yang diunduh juga dibuka otomatis*: saat Anda memilih Download sendiri (semua ukuran).
+  - *Edit in Excel desktop app* / *Open in Excel Desktop app* / tombol *Open in Excel* di pratinjau
+    selalu benar-benar membuka Excel/Word desktop (file diunduh lalu dibuka), bukan Office web.
+    Tautan `ms-excel:`/`ms-word:`/`ms-powerpoint:` dari Outlook juga langsung diteruskan ke Office desktop.
+  - Jenis file (Excel, Word, PowerPoint, PDF) berlaku untuk keduanya; ukuran minimal (boleh desimal,
+    mis. 0.5 MB) hanya untuk klik lampiran: yang lebih kecil tetap dipratinjau di Outlook.
 - **Penjaga stabilitas**:
   - Halaman Outlook mati → dimuat ulang **di halaman yang sama**, dengan alasan (mis. kehabisan memori).
   - WebView2 berhenti total → jendela yang terbuka dibuka lagi otomatis.

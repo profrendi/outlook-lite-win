@@ -194,9 +194,20 @@ fn attach_type_on(s: &Settings, ext: &str) -> bool {
     }
 }
 
-/// Unduhan ini langsung dibuka di aplikasi desktop?
-fn attach_should_open(s: &Settings, ext: &str, size_mb: f64) -> bool {
-    s.attach_desktop && attach_type_on(s, ext) && size_mb + 1e-9 >= s.attach_min_mb
+/// Unduhan manual (Anda memilih Download sendiri) langsung dibuka di aplikasi desktop?
+/// Ukuran minimal tidak berlaku di sini: ukuran minimal hanya memilih antara pratinjau web dan
+/// desktop saat lampiran diklik; file yang sengaja diunduh selalu dibuka.
+fn attach_should_open(s: &Settings, ext: &str, _size_mb: f64) -> bool {
+    s.attach_desktop && attach_type_on(s, ext)
+}
+
+/// Jenis file Office/PDF yang dikenal (untuk "Open in desktop app").
+fn attach_known_type(ext: &str) -> bool {
+    matches!(
+        ext,
+        "xlsx" | "xls" | "xlsm" | "xlsb" | "csv" | "docx" | "doc" | "docm" | "rtf" | "pptx"
+            | "ppt" | "pptm" | "ppsx" | "pdf" | "vsdx"
+    )
 }
 
 fn blocked_hosts_for(s: &Settings) -> &'static [&'static str] {
@@ -275,6 +286,10 @@ enum UserEvent {
     ProcessFailed(i32, i32, String),
     /// Unduhan selesai: (alamat, file, berhasil).
     Download(String, Option<PathBuf>, bool),
+    /// Halaman meminta "buka di aplikasi desktop" Office (ms-excel:... dsb.).
+    OfficeUri(String),
+    /// Jendela popup Microsoft dibuka (untuk log: hanya host + awal path).
+    PopupOpened(String),
     /// Navigasi halaman utama selesai (berhasil, status error WebView2).
     NavDone(bool, i32),
     /// Pesan dari jendela Pengaturan.
@@ -915,7 +930,9 @@ struct Guard {
     /// Pengukur CPU untuk catatan log 10 menit (terpisah dari diagnostik).
     log_sampler: Option<diag::Sampler>,
     /// Lampiran yang diklik (mode eksperimen): nama file & perkiraan ukuran MB.
-    attach_click: Option<(String, Option<f64>, Instant)>,
+    /// (nama, ukuran MB, waktu, jalur). Jalur "desktop" = pengguna memilih "Open/Edit in
+    /// desktop app" → selalu dibuka di desktop apa pun pengaturan jenis/ukurannya.
+    attach_click: Option<(String, Option<f64>, Instant, String)>,
 }
 
 impl App {
@@ -1281,10 +1298,13 @@ impl App {
             "sel": st.unread_selector,
             "nosw": st.block_service_worker,
             // Eksperimen: klik lampiran = unduh lalu buka di aplikasi desktop.
-            "att": st.attach_intercept_preview.then(|| serde_json::json!({
+            // "Open/Edit in desktop app" pada lampiran selalu diarahkan ke unduh + buka desktop;
+            // klik lampiran biasa hanya bila "Klik lampiran langsung buka di desktop" menyala.
+            "att": {
                 "types": att_types,
                 "min": st.attach_min_mb,
-            })),
+                "intercept": st.attach_intercept_preview,
+            },
         });
         let init_js = format!("window.__oliteCfg = {cfg};\n{MONITOR_JS}");
         let zoom = self.settings.zoom;
@@ -1297,6 +1317,8 @@ impl App {
         let proxy_ipc = self.proxy.clone();
         let proxy_load = self.proxy.clone();
         let proxy_dl = self.proxy.clone();
+        let proxy_nav = self.proxy.clone();
+        let proxy_win = self.proxy.clone();
         let mobile = !visible && self.settings.tray_mobile_ui;
 
         let builder = WebViewBuilder::new_with_web_context(&mut self.web_context)
@@ -1321,9 +1343,24 @@ impl App {
             .with_download_completed_handler(move |uri, path, ok| {
                 let _ = proxy_dl.send_event(UserEvent::Download(uri, path, ok));
             })
-            .with_new_window_req_handler(|url, _features| {
-                if url.starts_with("about:") || is_microsoft_url(&url) {
+            // "Open in desktop app" Office memakai skema ms-excel:/ms-word:...; jalankan langsung
+            // aplikasi desktopnya (bukan dibiarkan ke Office web).
+            .with_navigation_handler(move |url: String| {
+                if win::is_office_uri(&url) {
+                    let _ = proxy_nav.send_event(UserEvent::OfficeUri(url));
+                    return false;
+                }
+                true
+            })
+            .with_new_window_req_handler(move |url, _features| {
+                if win::is_office_uri(&url) {
+                    let _ = proxy_win.send_event(UserEvent::OfficeUri(url));
+                    NewWindowResponse::Deny
+                } else if url.starts_with("about:") || is_microsoft_url(&url) {
                     // Popup login, compose pop-out, dsb.
+                    if !url.starts_with("about:") {
+                        let _ = proxy_win.send_event(UserEvent::PopupOpened(url));
+                    }
                     NewWindowResponse::Allow
                 } else {
                     // Tautan di email dibuka di browser default.
@@ -1370,6 +1407,16 @@ impl App {
             let p = self.proxy.clone();
             win::on_process_failed(&webview, move |k, r, d| {
                 let _ = p.send_event(UserEvent::ProcessFailed(k, r, d));
+            });
+            // Skema ms-excel: dsb. dari bingkai mana pun (termasuk pratinjau Office).
+            let p = self.proxy.clone();
+            win::on_external_scheme(&webview, move |uri| {
+                if win::is_office_uri(&uri) {
+                    let _ = p.send_event(UserEvent::OfficeUri(uri));
+                    true
+                } else {
+                    false
+                }
             });
             let p = self.proxy.clone();
             win::on_navigation_completed(&webview, move |ok, status| {
@@ -1942,12 +1989,17 @@ impl App {
             .guard
             .attach_click
             .take()
-            .filter(|(_, _, t)| t.elapsed() < Duration::from_secs(120));
-        // Unduhan dari "klik lampiran = buka di desktop": selalu dibuka bila jenisnya dipilih,
-        // walau "Buka lampiran yang diunduh" mati. (Nama file bisa berbeda, mis. "Data (1).xlsx".)
-        let from_click = self.settings.attach_intercept_preview
-            && clicked.is_some()
-            && attach_type_on(&self.settings, &ext);
+            .filter(|(_, _, t, _)| t.elapsed() < Duration::from_secs(120));
+        // Unduhan yang kita picu sendiri (klik lampiran / "Open in desktop app"): selalu dibuka,
+        // walau "Lampiran yang diunduh juga dibuka" mati. (Nama file bisa berbeda, mis.
+        // "Data (1).xlsx".) "Open in desktop app" = pilihan eksplisit: semua jenis Office/PDF.
+        let from_click = clicked.as_ref().is_some_and(|(_, _, _, via)| {
+            if via == "desktop" {
+                attach_known_type(&ext)
+            } else {
+                self.settings.attach_intercept_preview && attach_type_on(&self.settings, &ext)
+            }
+        });
         let open = attach_should_open(&self.settings, &ext, mb) || from_click;
         self.log(&format!(
             "unduhan selesai: .{ext} {mb:.1} MB{}",
@@ -3670,6 +3722,20 @@ impl App {
                     self.on_process_failed(target, kind, reason, detail)
                 }
                 UserEvent::Download(uri, path, ok) => self.on_download(uri, path, ok),
+                UserEvent::OfficeUri(uri) => {
+                    let scheme = uri.split(':').next().unwrap_or("").to_ascii_lowercase();
+                    self.log(&format!("membuka aplikasi desktop Office ({scheme})"));
+                    win::open_office_uri(&uri);
+                }
+                UserEvent::PopupOpened(url) => {
+                    let host = urlutil::host_of(&url).unwrap_or_default();
+                    let first = url
+                        .splitn(4, '/')
+                        .nth(3)
+                        .and_then(|p| p.split(['/', '?', '#']).next())
+                        .unwrap_or("");
+                    self.log(&format!("jendela popup dibuka: {host}/{first}"));
+                }
                 UserEvent::NavDone(ok, status) => self.on_nav_done(ok, status),
                 UserEvent::SettingsUi(body) => self.on_settings_msg(target, &body),
                 UserEvent::Page(PageMsg::State {
@@ -3686,10 +3752,10 @@ impl App {
                 UserEvent::Page(PageMsg::Inspect(data)) => self.on_inspect(data),
                 UserEvent::Page(PageMsg::Attach { name, mb, via }) => {
                     self.log(&format!(
-                        "lampiran diklik: diunduh lewat {via} untuk dibuka di desktop ({})",
+                        "lampiran: diunduh lewat {via} untuk dibuka di desktop ({})",
                         mb.map_or("ukuran ?".into(), |m| format!("{m:.1} MB"))
                     ));
-                    self.guard.attach_click = Some((name, mb, Instant::now()));
+                    self.guard.attach_click = Some((name, mb, Instant::now(), via));
                 }
                 UserEvent::Page(PageMsg::AttachLog(msg)) => {
                     self.log(&format!("lampiran: {msg}"));
@@ -3993,5 +4059,27 @@ mod tests {
             mailto: Some("mailto:x@y.z".into()),
         };
         assert!(urlutil::mailto_to_compose(a.mailto.as_deref().unwrap()).is_some());
+    }
+
+    #[test]
+    fn lampiran_unduhan_manual_tanpa_batas_ukuran() {
+        let mut s = Settings::default();
+        s.attach_desktop = true;
+        s.attach_min_mb = 0.2;
+        assert!(attach_should_open(&s, "xlsx", 0.1), "unduhan manual selalu dibuka");
+        assert!(!attach_should_open(&s, "png", 5.0));
+        s.attach_pdf = false;
+        assert!(!attach_should_open(&s, "pdf", 1.0));
+        s.attach_desktop = false;
+        assert!(!attach_should_open(&s, "xlsx", 1.0));
+        assert!(attach_known_type("xls") && attach_known_type("pdf") && !attach_known_type("zip"));
+    }
+
+    #[test]
+    fn skema_office_desktop() {
+        assert!(win::is_office_uri("ms-excel:ofe|u|https://x.sharepoint.com/a.xlsx"));
+        assert!(win::is_office_uri("MS-WORD:ofe|u|https://x/a.docx"));
+        assert!(!win::is_office_uri("https://excel.officeapps.live.com/x"));
+        assert!(!win::is_office_uri("mailto:a@b.c"));
     }
 }

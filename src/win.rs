@@ -38,6 +38,33 @@ pub fn open_url(url: &str) {
     spawn_hidden("rundll32", &["url.dll,FileProtocolHandler", url]);
 }
 
+/// Skema "buka di aplikasi desktop" Office (ms-excel:ofe|u|https://...), dipakai Outlook/Office
+/// web untuk tombol "Open in desktop app".
+pub fn is_office_uri(uri: &str) -> bool {
+    let l = uri.trim_start().to_ascii_lowercase();
+    [
+        "ms-excel:",
+        "ms-word:",
+        "ms-powerpoint:",
+        "ms-visio:",
+        "ms-access:",
+        "ms-project:",
+        "ms-publisher:",
+        "ms-spd:",
+        "ms-infopath:",
+        "onenote:",
+    ]
+    .iter()
+    .any(|p| l.starts_with(p))
+}
+
+/// Jalankan aplikasi Office desktop lewat skema URI-nya (tanpa dialog WebView2).
+pub fn open_office_uri(uri: &str) {
+    if is_office_uri(uri) && uri.len() < 8192 {
+        spawn_hidden("rundll32", &["url.dll,FileProtocolHandler", uri.trim()]);
+    }
+}
+
 /// Buka file dengan aplikasi default Windows (mis. .xlsx → Excel).
 pub fn open_file(path: &Path) {
     let _ = std::process::Command::new(if cfg!(windows) {
@@ -833,6 +860,37 @@ mod imp {
         }
     }
 
+    /// Halaman meminta membuka skema eksternal (mis. ms-excel:). `cb(uri)` = true → kita yang
+    /// menangani (WebView2 dibatalkan, tidak ada dialog/pemblokiran).
+    pub fn on_external_scheme(webview: &wry::WebView, cb: impl Fn(String) -> bool + 'static) {
+        use webview2_com::{
+            Microsoft::Web::WebView2::Win32::ICoreWebView2_18, LaunchingExternalUriSchemeEventHandler,
+        };
+        use windows::core::Interface;
+        use wry::WebViewExtWindows;
+        let Ok(wv18) = webview.webview().cast::<ICoreWebView2_18>() else {
+            return;
+        };
+        let handler = LaunchingExternalUriSchemeEventHandler::create(Box::new(move |_wv, args| {
+            let Some(a) = args else { return Ok(()) };
+            let mut p = windows::core::PWSTR::null();
+            unsafe {
+                a.Uri(&mut p)?;
+            }
+            let uri = webview2_com::take_pwstr(p);
+            if cb(uri) {
+                unsafe {
+                    a.SetCancel(true)?;
+                }
+            }
+            Ok(())
+        }));
+        let mut token = 0i64;
+        unsafe {
+            let _ = wv18.add_LaunchingExternalUriScheme(&handler, &mut token);
+        }
+    }
+
     /// Ringkasan sistem untuk laporan diagnostik (tanpa data pribadi).
     pub fn system_info() -> String {
         use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -976,6 +1034,7 @@ mod imp {
         String::new()
     }
     pub fn on_process_failed(_webview: &wry::WebView, _cb: impl Fn(i32, i32, String) + 'static) {}
+    pub fn on_external_scheme(_webview: &wry::WebView, _cb: impl Fn(String) -> bool + 'static) {}
     pub fn on_navigation_completed(_webview: &wry::WebView, _cb: impl Fn(bool, i32) + 'static) {}
     pub fn is_online() -> bool {
         true
